@@ -1,18 +1,55 @@
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use eframe::egui;
+use parking_lot::Mutex;
 use uuid::Uuid;
 
 use crate::autofill;
 use crate::config::{AppConfig, SmtpAccount};
-use crate::logger::{LogLevel, Logger};
+use crate::logger::{LogLevel, LogItem, Logger};
 use crate::progress::SendProgress;
 use crate::schedule;
 use crate::sender::start_send_task;
+
+/// 主窗口底部状态条高度（只放一行：最新日志 + 计数 + 打开日志按钮）
+const STATUS_BAR_HEIGHT: f32 = 28.0;
+
+/// 日志窗口初始尺寸 / 最小尺寸
+const LOG_WINDOW_SIZE: [f32; 2] = [720.0, 520.0];
+const LOG_WINDOW_MIN_SIZE: [f32; 2] = [480.0, 320.0];
+
+/// 日志视图的滚动跟随状态（主窗口状态条与日志窗口共用同一份）
+#[derive(Default)]
+struct LogUiState {
+    /// 是否自动跟随到日志底部（用户上滚/选中文本时暂停）
+    follow: bool,
+    /// 上一帧日志条数（判断是否出现新内容）
+    seen: usize,
+    /// 上一帧日志滚动偏移（判断是否用户手动滚动）
+    last_offset: f32,
+    /// 上一帧日志滚动区可视区域（判断鼠标是否在日志区内操作）
+    view_rect: Option<egui::Rect>,
+    /// 是否请求「回到底部」一次性跳转
+    jump: bool,
+}
+
+impl LogUiState {
+    fn new() -> Self {
+        Self {
+            follow: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// 日志窗口的固定 viewport id（固定的 id 保证反复打开只会复用同一个窗口）
+fn log_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("mailsender_log_window")
+}
 
 pub struct MailApp {
     tab: AppTab,
@@ -57,17 +94,19 @@ pub struct MailApp {
     /// 本次发送任务实际使用了定时（用于结束后复位）
     schedule_used_this_run: bool,
 
-    /* ========== 日志区滚动跟随状态 ========== */
-    /// 是否自动跟随到日志底部（用户上滚/选中文本时暂停）
-    log_follow: bool,
-    /// 上一帧日志条数（判断是否出现新内容）
-    log_seen: usize,
-    /// 上一帧日志滚动偏移（判断是否用户手动滚动）
-    log_last_offset: f32,
-    /// 上一帧日志滚动区可视区域（判断鼠标是否在日志区内操作）
-    log_view_rect: Option<egui::Rect>,
-    /// 是否请求「回到底部」一次性跳转
-    log_jump: bool,
+    /* ========== 日志窗口（独立 OS 窗口） ========== */
+    /// 日志窗口是否应当显示（子窗口收到关闭事件时由回调置 false）
+    log_open: Arc<AtomicBool>,
+    /// 日志滚动跟随状态（日志窗口渲染、主窗口状态条共读共写）
+    log_ui: Arc<Mutex<LogUiState>>,
+    /// 本帧处理完后是否请求「打开/前置」日志窗口
+    pending_open_log: bool,
+    /// 下一次渲染日志窗口时是否发送 Focus（只发一次）
+    log_focus_pending: bool,
+    /// 日志窗口的初始位置（首次打开时按主窗口位置算一次，之后保持不变）
+    log_pos: Option<egui::Pos2>,
+    /// 窗口图标（日志窗口复用同一图标）
+    app_icon: Option<Arc<egui::IconData>>,
 
     /// 当前账号编辑缓存
     edit_account: Option<SmtpAccount>,
@@ -142,11 +181,12 @@ impl Default for MailApp {
             sched_time,
             sched_user_set,
             schedule_used_this_run: false,
-            log_follow: true,
-            log_seen: 0,
-            log_last_offset: 0.0,
-            log_view_rect: None,
-            log_jump: false,
+            log_open: Arc::new(AtomicBool::new(false)),
+            log_ui: Arc::new(Mutex::new(LogUiState::new())),
+            pending_open_log: false,
+            log_focus_pending: false,
+            log_pos: None,
+            app_icon: crate::load_app_icon().map(Arc::new),
             edit_account: None,
             edit_account_id: None,
         }
@@ -198,24 +238,39 @@ impl eframe::App for MailApp {
             });
         });
 
-        // 日志只在发送页展示：设置页不再显示日志面板
-        if self.tab == AppTab::Send {
-            egui::Panel::bottom("log_panel")
-                .resizable(true)
-                .default_size(190.0)
-                .size_range(120.0..=520.0)
-                .show(ui, |ui| self.ui_logs(ui));
-        }
+        // 主窗口底部固定一行状态条（替代原来的可拖拽日志面板）：
+        // 只占 28px，不再挤压中央区；完整日志在独立日志窗口里看。
+        egui::Panel::bottom("status_bar")
+            .exact_size(STATUS_BAR_HEIGHT)
+            .resizable(false)
+            .show(ui, |ui| self.ui_status_bar(ui));
 
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             AppTab::Send => self.ui_send(ui),
             AppTab::Settings => self.ui_settings(ui),
         });
 
-        // 只在需要刷新时请求重绘：发送中刷新进度/倒计时，发送页勾选定时后刷新预览；
+        // 日志窗口：先处理本帧的「打开/前置」请求，再在需要时重新声明该视口。
+        // 必须在 UI 之后做，这样本帧按钮点击产生的请求也能立刻生效。
+        if self.pending_open_log {
+            self.pending_open_log = false;
+            self.request_log_window(&ctx);
+        }
+        if self.log_open.load(Ordering::Relaxed) {
+            self.show_log_window(&ctx);
+        }
+
+        // 只在需要刷新时请求重绘：发送中刷新进度/倒计时/日志窗口，发送页勾选定时后刷新预览；
         // 空闲时不再固定每 200ms 重绘，避免无意义的 UI 空转。
         if self.sending {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            if self.log_open.load(Ordering::Relaxed) {
+                // 后台线程写日志不会唤醒 UI，这里按节奏唤醒日志子窗口
+                ctx.request_repaint_after_for(
+                    std::time::Duration::from_millis(200),
+                    log_viewport_id(),
+                );
+            }
         } else if self.tab == AppTab::Send && self.sched_enabled {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
@@ -656,6 +711,8 @@ impl MailApp {
         self.progress = Some(progress.clone());
         self.sending = true;
         self.schedule_used_this_run = schedule_at.is_some();
+        // 开始发送时自动打开日志窗口（已打开则只做前置，不会多开窗口）
+        self.pending_open_log = true;
         self.config.history.record(&to);
         thread::spawn(move || {
             start_send_task(&files, &to, &subject, &body, &config, schedule_at, progress, logger);
@@ -826,86 +883,232 @@ impl MailApp {
         }
     }
 
-    /* =================== 日志区 =================== */
+    /* =================== 底部状态条 =================== */
 
-    fn ui_logs(&mut self, ui: &mut egui::Ui) {
+    /// 主窗口底部一行状态条：最新日志 + 总条数 + 跟随状态 + 打开日志按钮
+    fn ui_status_bar(&mut self, ui: &mut egui::Ui) {
         let entries = self.logger.entries();
-        let has_new = entries.len() > self.log_seen;
+        let total = entries.len();
+        let follow = self.log_ui.lock().follow;
 
-        // 鼠标按住且位于日志滚动区内（拖动滚动条 / 选中文本）时，本帧不抢滚动
-        let pointer_busy = ui.ctx().input(|i| i.pointer.any_down())
-            && self.log_view_rect.is_some_and(|r| {
-                ui.ctx()
-                    .input(|i| i.pointer.interact_pos().is_some_and(|p| r.contains(p)))
-            });
+        // 右侧固定块宽度（打开日志 + 共 N 条 + ⤓ + 进度文字）
+        let right_width = if self.sending { 300.0 } else { 200.0 };
+        let left_width = (ui.available_width() - right_width).max(80.0);
 
-        ui.horizontal(|ui| {
-            ui.strong("运行日志");
+        ui.horizontal_centered(|ui| {
+            // 左侧：最新一条日志（宽度不足时截断）
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_width, ui.available_height()),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| match entries.last() {
+                    Some(log) => {
+                        ui.label(egui::RichText::new("●").color(level_color(log.level)));
+                        ui.add(
+                            egui::Label::new(format!("[{}] {}", log.time, log.message))
+                                .truncate(),
+                        );
+                    }
+                    None => {
+                        ui.weak("暂无日志");
+                    }
+                },
+            );
+
+            // 右侧：进度状态 / 跟随暂停 / 条数 / 打开日志（从右到左排）
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !self.log_follow {
-                    ui.colored_label(egui::Color32::YELLOW, "已暂停自动跟随");
-                    if ui
-                        .button("⤓ 回到底部")
-                        .on_hover_text("恢复自动滚动到最新日志")
-                        .clicked()
-                    {
-                        self.log_follow = true;
-                        self.log_jump = true;
+                if ui
+                    .button("打开日志")
+                    .on_hover_text("打开独立的日志窗口（已打开则前置）")
+                    .clicked()
+                {
+                    self.pending_open_log = true;
+                }
+                ui.label(format!("共 {} 条", total));
+                if !follow {
+                    ui.colored_label(egui::Color32::YELLOW, "⤓")
+                        .on_hover_text("日志窗口已暂停自动跟随（可回到底部恢复）");
+                }
+                if self.sending {
+                    if let Some(p) = &self.progress {
+                        ui.label(progress_summary(p));
                     }
                 }
             });
         });
+    }
 
-        // 只有「跟随中且有新内容」或用户点了「回到底部」时才滚动一次，
-        // 每帧无条件贴底会把用户正在查看的历史日志抢走
-        let stick = ((self.log_follow && has_new) || self.log_jump) && !pointer_busy;
+    /* =================== 日志窗口 =================== */
 
-        let out = egui::ScrollArea::vertical()
-            .id_salt("log_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for log in &entries {
-                    let color = match log.level {
-                        LogLevel::Info => egui::Color32::LIGHT_GREEN,
-                        LogLevel::Warn => egui::Color32::YELLOW,
-                        LogLevel::Error => egui::Color32::RED,
-                    };
-                    ui.colored_label(color, format!("[{}] {}", log.time, log.message));
+    /// 请求打开/前置日志窗口；首次打开时按主窗口位置计算一个不遮挡它的初始位置
+    fn request_log_window(&mut self, ctx: &egui::Context) {
+        if !self.log_open.swap(true, Ordering::Relaxed) {
+            let root = ctx.input(|i| i.viewport().outer_rect);
+            let monitor = ctx.input(|i| i.viewport().monitor_size);
+            self.log_pos = root.map(|r| {
+                let mut pos = egui::pos2(r.max.x + 16.0, r.min.y + 28.0);
+                if let Some(m) = monitor {
+                    // 贴近屏幕右缘时向左回退，避免窗口跑到屏幕外
+                    pos.x = pos.x.min((m.x - LOG_WINDOW_SIZE[0] - 12.0).max(12.0));
+                    pos.y = pos.y.clamp(12.0, (m.y - LOG_WINDOW_SIZE[1] - 12.0).max(12.0));
                 }
-                if stick {
-                    ui.scroll_to_cursor_animation(
-                        Some(egui::Align::BOTTOM),
-                        egui::style::ScrollAnimation::none(),
-                    );
+                pos
+            });
+        }
+        self.log_focus_pending = true;
+        ctx.request_repaint();
+    }
+
+    /// 每帧声明日志视口（固定 ViewportId → 永远复用同一个 OS 窗口，不会重复开窗）
+    fn show_log_window(&mut self, ctx: &egui::Context) {
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("运行日志 — MailSender")
+            .with_inner_size(LOG_WINDOW_SIZE)
+            .with_min_inner_size(LOG_WINDOW_MIN_SIZE)
+            .with_resizable(true);
+        if let Some(icon) = &self.app_icon {
+            builder = builder.with_icon(icon.clone());
+        }
+        if let Some(pos) = self.log_pos {
+            builder = builder.with_position(pos);
+        }
+
+        let open = self.log_open.clone();
+        let logger = self.logger.clone();
+        let shared = self.log_ui.clone();
+
+        ctx.show_viewport_deferred(log_viewport_id(), builder, move |ui, _class| {
+            // 用户点了子窗口的关闭按钮：只把「应显示」置 false，
+            // 主窗口下一帧不再声明该视口，eframe 自会销毁这个 OS 窗口；
+            // 发送线程/进度/状态条都不经过视口，因此不受影响。
+            if ui.input(|i| i.viewport().close_requested()) {
+                open.store(false, Ordering::Relaxed);
+                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+            }
+
+            egui::CentralPanel::default().show(ui, |ui| {
+                let entries = logger.entries();
+                let mut st = shared.lock();
+                let follow_before = st.follow;
+
+                log_header(ui, &mut st, entries.len());
+                draw_log_scroll(ui, &entries, &mut st);
+
+                // 跟随状态变化时唤醒主窗口，让状态条的 ⤓ 提示同步
+                if st.follow != follow_before {
+                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
                 }
             });
+        });
 
-        // 用实际滚动偏移判断用户是否在查看历史：
-        // - 用户自己把位置移到/移回底部 → 暂停 / 恢复跟随
-        // - 鼠标按住日志区（选中文本/拖动） → 暂停跟随
-        let max_offset = (out.content_size.y - out.inner_rect.height()).max(0.0);
-        let offset = out.state.clamped_offset().y;
-        let at_bottom = max_offset - offset <= 1.0;
-        let offset_changed = (offset - self.log_last_offset).abs() > 0.5;
-        // 内容不足一屏时永远视为「在底部」
-        let fits = max_offset <= 0.0;
-
-        if fits || self.log_jump {
-            self.log_follow = true;
-        } else if offset_changed {
-            // 用户自己把滚动位置移到了底部 → 恢复跟随；移到中间 → 暂停
-            self.log_follow = at_bottom;
+        if self.log_focus_pending {
+            self.log_focus_pending = false;
+            ctx.send_viewport_cmd_to(log_viewport_id(), egui::ViewportCommand::Focus);
         }
-        // 鼠标按住日志区（拖滚动条 / 选中文本）期间一律暂停跟随，
-        // 松开后保持暂停，直到用户滚回底部或点「回到底部」
-        if pointer_busy {
-            self.log_follow = false;
-        }
+    }
+}
 
-        self.log_jump = false;
-        self.log_last_offset = offset;
-        self.log_seen = entries.len();
-        self.log_view_rect = Some(out.inner_rect);
+/// 日志窗口标题行（共 N 条 + 暂停跟随时的「回到底部」）
+fn log_header(ui: &mut egui::Ui, st: &mut LogUiState, total: usize) {
+    ui.horizontal(|ui| {
+        ui.strong("运行日志");
+        ui.weak(format!("共 {} 条", total));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !st.follow {
+                ui.colored_label(egui::Color32::YELLOW, "已暂停自动跟随");
+                if ui
+                    .button("⤓ 回到底部")
+                    .on_hover_text("恢复自动滚动到最新日志")
+                    .clicked()
+                {
+                    st.follow = true;
+                    st.jump = true;
+                }
+            }
+        });
+    });
+}
+
+/// 日志滚动区（含「不操作时自动跟随」逻辑），日志窗口与状态条共用同一份 `LogUiState`
+fn draw_log_scroll(ui: &mut egui::Ui, entries: &[LogItem], st: &mut LogUiState) {
+    let has_new = entries.len() > st.seen;
+
+    // 鼠标按住且位于日志滚动区内（拖动滚动条 / 选中文本）时，本帧不抢滚动
+    let pointer_busy = ui.ctx().input(|i| i.pointer.any_down())
+        && st.view_rect.is_some_and(|r| {
+            ui.ctx()
+                .input(|i| i.pointer.interact_pos().is_some_and(|p| r.contains(p)))
+        });
+
+    // 只有「跟随中且有新内容」或用户点了「回到底部」时才滚动一次，
+    // 每帧无条件贴底会把用户正在查看的历史日志抢走
+    let stick = ((st.follow && has_new) || st.jump) && !pointer_busy;
+
+    let out = egui::ScrollArea::vertical()
+        .id_salt("log_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for log in entries {
+                ui.colored_label(level_color(log.level), format!("[{}] {}", log.time, log.message));
+            }
+            if stick {
+                ui.scroll_to_cursor_animation(
+                    Some(egui::Align::BOTTOM),
+                    egui::style::ScrollAnimation::none(),
+                );
+            }
+        });
+
+    // 用实际滚动偏移判断用户是否在查看历史：
+    // - 用户自己把位置移到/移回底部 → 暂停 / 恢复跟随
+    // - 鼠标按住日志区（选中文本/拖动） → 暂停跟随
+    let max_offset = (out.content_size.y - out.inner_rect.height()).max(0.0);
+    let offset = out.state.clamped_offset().y;
+    let at_bottom = max_offset - offset <= 1.0;
+    let offset_changed = (offset - st.last_offset).abs() > 0.5;
+    // 内容不足一屏时永远视为「在底部」
+    let fits = max_offset <= 0.0;
+
+    if fits || st.jump {
+        st.follow = true;
+    } else if offset_changed {
+        // 用户自己把滚动位置移到了底部 → 恢复跟随；移到中间 → 暂停
+        st.follow = at_bottom;
+    }
+    // 鼠标按住日志区（拖滚动条 / 选中文本）期间一律暂停跟随，
+    // 松开后保持暂停，直到用户滚回底部或点「回到底部」
+    if pointer_busy {
+        st.follow = false;
+    }
+
+    st.jump = false;
+    st.last_offset = offset;
+    st.seen = entries.len();
+    st.view_rect = Some(out.inner_rect);
+}
+
+/// 日志级别对应的颜色（状态条圆点、日志行共用）
+fn level_color(level: LogLevel) -> egui::Color32 {
+    match level {
+        LogLevel::Info => egui::Color32::LIGHT_GREEN,
+        LogLevel::Warn => egui::Color32::YELLOW,
+        LogLevel::Error => egui::Color32::RED,
+    }
+}
+
+/// 状态条右侧的发送状态摘要（等待倒计时 / 分卷进度 / 正在停止）
+fn progress_summary(p: &SendProgress) -> String {
+    if p.is_waiting() {
+        format!("⏳ 剩余 {}", format_left(p.waiting_left()))
+    } else if p.is_stopped() {
+        "正在停止…".to_string()
+    } else {
+        format!(
+            "文件 {}/{} · 卷 {}/{}",
+            p.current_file_index.load(Ordering::Relaxed),
+            p.total_files,
+            p.current_file_sent_parts.load(Ordering::Relaxed),
+            p.current_file_total_parts.load(Ordering::Relaxed).max(1)
+        )
     }
 }
 
