@@ -5,6 +5,7 @@ mod autofill;
 mod config;
 mod logger;
 mod progress;
+mod schedule;
 mod sender;
 mod sevenz;
 

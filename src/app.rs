@@ -11,6 +11,7 @@ use crate::autofill;
 use crate::config::{AppConfig, SmtpAccount};
 use crate::logger::{LogLevel, Logger};
 use crate::progress::SendProgress;
+use crate::schedule;
 use crate::sender::start_send_task;
 
 pub struct MailApp {
@@ -51,6 +52,8 @@ pub struct MailApp {
     sched_date: (i32, u32, u32),
     /// 选定时间（时/分/秒）
     sched_time: (u32, u32, u32),
+    /// 用户是否手动选过时间（没选过时，勾选定时会重置为 now+30min）
+    sched_user_set: bool,
     /// 本次发送任务实际使用了定时（用于结束后复位）
     schedule_used_this_run: bool,
 
@@ -93,8 +96,9 @@ impl Default for MailApp {
         }
 
         // 旧版全局定时开关迁移：schedule_enabled 不再作为常驻配置。
-        // 处理策略：直接忽略该开关并记录迁移说明；旧的时间字符串仅作为
-        // 时间选择控件的初始值提示，不会自动启用定时。
+        // 旧的时间字符串只作为「用户之前选过的时间」预填控件，且必须是未来时间，
+        // 不会自动启用定时；其余情况一律用 now+30min 作为默认值。
+        let legacy_start = config.parse_schedule_start().ok().flatten();
         if config.schedule_enabled {
             logger.warn(
                 "检测到旧版「全局定时开始」配置，已按新语义忽略：定时现在是每次发送的一次性选项（时间已预填到发送页，未启用）"
@@ -105,13 +109,20 @@ impl Default for MailApp {
             let _ = config.save();
         }
 
-        // 定时控件默认值：明天同一时间；若旧配置里有合法时间则预填
-        let tomorrow = chrono::Local::now().naive_local() + Duration::days(1);
-        let mut sched_date = (tomorrow.year(), tomorrow.month(), tomorrow.day());
-        let mut sched_time = (tomorrow.hour(), tomorrow.minute(), 0u32);
-        if let Ok(Some(t)) = config.parse_schedule_start() {
+        // 定时控件默认值：当前本地时间 + 30 分钟（秒取整为 0）
+        let now = chrono::Local::now().naive_local();
+        let default_start = schedule::default_start(now);
+        let mut sched_date = (default_start.year(), default_start.month(), default_start.day());
+        let mut sched_time = (
+            default_start.hour(),
+            default_start.minute(),
+            default_start.second(),
+        );
+        let mut sched_user_set = false;
+        if let Some(t) = legacy_start.filter(|t| *t > now) {
             sched_date = (t.year(), t.month(), t.day());
             sched_time = (t.hour(), t.minute(), t.second());
+            sched_user_set = true;
         }
 
         Self {
@@ -129,6 +140,7 @@ impl Default for MailApp {
             sched_enabled: false,
             sched_date,
             sched_time,
+            sched_user_set,
             schedule_used_this_run: false,
             log_follow: true,
             log_seen: 0,
@@ -154,6 +166,8 @@ impl eframe::App for MailApp {
                 if self.schedule_used_this_run {
                     self.schedule_used_this_run = false;
                     self.sched_enabled = false;
+                    // 下次勾选时重新给「当前时间 + 30 分钟」，而不是沿用本次已经过去的时间
+                    self.sched_user_set = false;
                     self.logger.info("本次发送已结束，定时开始已复位（下次发送需重新勾选）");
                 }
             }
@@ -369,23 +383,56 @@ impl MailApp {
                 ui.add_space(4.0);
 
                 // ===== 定时开始（仅本次发送）=====
-                ui.checkbox(&mut self.sched_enabled, "⏰ 定时开始（仅本次发送有效）");
+                let sched_resp =
+                    ui.checkbox(&mut self.sched_enabled, "⏰ 定时开始（仅本次发送有效）");
+                // 勾选时：用户还没手动选过时间，就重置为「当前本地时间 + 30 分钟」
+                if sched_resp.changed() && self.sched_enabled && !self.sched_user_set {
+                    self.reset_schedule_default();
+                }
 
                 ui.add_enabled_ui(self.sched_enabled, |ui| {
+                    let mut edited = false;
                     ui.horizontal_wrapped(|ui| {
                         ui.label("开始时间");
-                        ui.add(
-                            egui::DragValue::new(&mut self.sched_date.0)
-                                .range(2024..=2100)
-                                .suffix(" 年"),
-                        );
-                        ui.add(egui::DragValue::new(&mut self.sched_date.1).range(1..=12).suffix(" 月"));
-                        ui.add(egui::DragValue::new(&mut self.sched_date.2).range(1..=31).suffix(" 日"));
-                        ui.add(egui::DragValue::new(&mut self.sched_time.0).range(0..=23).suffix(" 时"));
-                        ui.add(egui::DragValue::new(&mut self.sched_time.1).range(0..=59).suffix(" 分"));
-                        ui.add(egui::DragValue::new(&mut self.sched_time.2).range(0..=59).suffix(" 秒"));
+                        edited |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.sched_date.0)
+                                    .range(2024..=2100)
+                                    .suffix(" 年"),
+                            )
+                            .changed();
+                        edited |= ui
+                            .add(egui::DragValue::new(&mut self.sched_date.1).range(1..=12).suffix(" 月"))
+                            .changed();
+                        edited |= ui
+                            .add(egui::DragValue::new(&mut self.sched_date.2).range(1..=31).suffix(" 日"))
+                            .changed();
+                        edited |= ui
+                            .add(egui::DragValue::new(&mut self.sched_time.0).range(0..=23).suffix(" 时"))
+                            .changed();
+                        edited |= ui
+                            .add(egui::DragValue::new(&mut self.sched_time.1).range(0..=59).suffix(" 分"))
+                            .changed();
+                        edited |= ui
+                            .add(egui::DragValue::new(&mut self.sched_time.2).range(0..=59).suffix(" 秒"))
+                            .changed();
                     });
-                    ui.horizontal(|ui| {
+                    if edited {
+                        // 手动改过任何一个字段后，后续勾选/取消不再覆盖用户选择
+                        self.sched_user_set = true;
+                    }
+                    // 顺序：−1h −10m −5m | +1m +10m +1h；窄窗口自动换行避免挤爆
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("−1 小时").clicked() {
+                            self.shift_schedule(Duration::hours(-1));
+                        }
+                        if ui.button("−10 分钟").clicked() {
+                            self.shift_schedule(Duration::minutes(-10));
+                        }
+                        if ui.button("−5 分钟").clicked() {
+                            self.shift_schedule(Duration::minutes(-5));
+                        }
+                        ui.separator();
                         if ui.button("+1 分钟").clicked() {
                             self.shift_schedule(Duration::minutes(1));
                         }
@@ -464,12 +511,29 @@ impl MailApp {
         }
     }
 
-    /// 把控件时间整体平移（快捷按钮用）
+    /// 把控件时间整体平移（快捷按钮用）；用 chrono 做真实日期运算，跨天/跨月/跨年自动进位
     fn shift_schedule(&mut self, delta: Duration) {
         let base = self
             .schedule_target()
             .unwrap_or_else(|_| chrono::Local::now().naive_local());
-        let t = base + delta;
+        match schedule::shift(base, delta) {
+            Some(t) => {
+                self.set_schedule_time(t);
+                self.sched_user_set = true;
+            }
+            None => self.logger.warn("定时时间超出可表示范围，未修改"),
+        }
+    }
+
+    /// 勾选定时且用户尚未选过时间时，把控件重置为「当前本地时间 + 30 分钟」
+    fn reset_schedule_default(&mut self) {
+        let t = schedule::default_start(chrono::Local::now().naive_local());
+        self.set_schedule_time(t);
+        self.sched_user_set = false;
+    }
+
+    /// 把日期时间写回控件的年/月/日/时/分/秒
+    fn set_schedule_time(&mut self, t: NaiveDateTime) {
         self.sched_date = (t.year(), t.month(), t.day());
         self.sched_time = (t.hour(), t.minute(), t.second());
     }
