@@ -50,7 +50,7 @@ pub fn suggest_subject(files: &[PathBuf]) -> Option<String> {
 pub fn suggest_body(files: &[PathBuf], split_mb: u64, encrypted: bool) -> Option<String> {
     let sum = summarize_attachments(files)?;
     let enc = if encrypted {
-        "，压缩包已加密，密码请另行告知"
+        "，免密另行告知"
     } else {
         ""
     };
