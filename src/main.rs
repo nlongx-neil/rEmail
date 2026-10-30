@@ -8,34 +8,74 @@ mod sender;
 mod sevenz;
 
 use app::MailApp;
-use eframe::{egui};
+use eframe::egui;
 use std::fs;
 
-/// Windows + egui 主入口
+/// 桌面入口（Windows / macOS 通用）
 fn main() -> Result<(), eframe::Error> {
-    let mut options = eframe::NativeOptions::default();
-    options.centered = true;
+    // 窗口图标（128x128 PNG，来自 assets/，构建时嵌入二进制）
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Mail Sender")
+        .with_inner_size([1100.0, 760.0])
+        .with_min_inner_size([900.0, 600.0]);
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
+    let options = eframe::NativeOptions {
+        viewport,
+        centered: true,
+        // 0.37 默认渲染后端改为 wgpu，这里显式指定 glow（OpenGL），
+        // 保持与 0.27 时期相同的渲染路径，避免老机器驱动差异
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
 
     eframe::run_native(
         "Mail Sender",
         options,
         Box::new(|cc| {
-            // 使用微软雅黑，避免中文乱码
+            // 使用系统中文字体，避免中文乱码
             setup_font(&cc.egui_ctx);
 
-            Box::new(MailApp::default())
+            Ok(Box::new(MailApp::default()) as Box<dyn eframe::App>)
         }),
     )
 }
 
-/// 注册 msyh.ttc 字体
+/// 从内嵌 PNG 解码窗口图标；失败时返回 None（不影响启动）
+fn load_app_icon() -> Option<egui::IconData> {
+    const ICON_PNG: &[u8] = include_bytes!("../assets/icon_128.png");
+
+    match eframe::icon_data::from_png_bytes(ICON_PNG) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            eprintln!("加载窗口图标失败: {e}");
+            None
+        }
+    }
+}
+
+/// 注册中文字体（Windows 使用系统字体，macOS 使用 PingFang 等系统字体）
 fn setup_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     // 尝试系统字体（按优先级）
+    #[cfg(windows)]
     let candidates = [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\STSONG.TTF",
         r"C:\Windows\Fonts\simfang.ttf",
+    ];
+    #[cfg(target_os = "macos")]
+    let candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+    ];
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let candidates = [
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     ];
 
     let mut loaded = false;
@@ -44,7 +84,7 @@ fn setup_font(ctx: &egui::Context) {
         if let Ok(data) = fs::read(path) {
             fonts
                 .font_data
-                .insert("system_cn".into(), egui::FontData::from_owned(data));
+                .insert("system_cn".into(), egui::FontData::from_owned(data).into());
             loaded = true;
             break;
         }
@@ -71,7 +111,7 @@ fn setup_font(ctx: &egui::Context) {
             if let Ok(data) = std::fs::read(path) {
                 fonts
                     .font_data
-                    .insert("font".to_owned(), egui::FontData::from_owned(data));
+                    .insert("font".to_owned(), egui::FontData::from_owned(data).into());
 
                 fonts
                     .families
@@ -87,7 +127,17 @@ fn setup_font(ctx: &egui::Context) {
             }
         }
     }
-    // 从 exe 同目录加载 msyh.ttc
 
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn embedded_window_icon_decodes() {
+        let icon = super::load_app_icon().expect("assets/icon_128.png 应能解码为窗口图标");
+        assert_eq!(icon.width, 128);
+        assert_eq!(icon.height, 128);
+        assert_eq!(icon.rgba.len(), 128 * 128 * 4);
+    }
 }

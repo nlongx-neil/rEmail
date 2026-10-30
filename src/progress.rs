@@ -26,6 +26,15 @@ pub struct SendProgress {
 
     /// 当前文件已发送的分卷数
     pub current_file_sent_parts: Arc<AtomicU64>,
+
+    /// 后台任务是否已经结束（正常结束 / 出错 / 被停止）
+    pub finished: Arc<AtomicBool>,
+
+    /// 是否处于「等待定时开始」状态
+    pub waiting: Arc<AtomicBool>,
+
+    /// 距离定时开始还剩多少秒（0 表示已到点）
+    pub waiting_seconds_left: Arc<AtomicU64>,
 }
 
 impl SendProgress {
@@ -38,7 +47,45 @@ impl SendProgress {
             current_file_index: Arc::new(AtomicU64::new(0)),
             current_file_total_parts: Arc::new(AtomicU64::new(0)),
             current_file_sent_parts: Arc::new(AtomicU64::new(0)),
+            finished: Arc::new(AtomicBool::new(false)),
+            waiting: Arc::new(AtomicBool::new(false)),
+            waiting_seconds_left: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 后台任务结束时调用（由发送线程设置）
+    pub fn mark_finished(&self) {
+        self.waiting.store(false, Ordering::Relaxed);
+        self.finished.store(true, Ordering::Relaxed);
+    }
+
+    /// 任务是否已经结束
+    #[inline]
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
+    }
+
+    /// 进入等待定时开始状态
+    pub fn set_waiting(&self, seconds_left: u64) {
+        self.waiting_seconds_left
+            .store(seconds_left, Ordering::Relaxed);
+        self.waiting.store(true, Ordering::Relaxed);
+    }
+
+    /// 退出等待状态（到点 / 被停止）
+    pub fn clear_waiting(&self) {
+        self.waiting.store(false, Ordering::Relaxed);
+        self.waiting_seconds_left.store(0, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn waiting_left(&self) -> u64 {
+        self.waiting_seconds_left.load(Ordering::Relaxed)
     }
 
     /// 是否被停止
