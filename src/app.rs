@@ -184,7 +184,7 @@ impl eframe::App for MailApp {
                         if let Some(p) = &self.progress {
                             if p.is_waiting() {
                                 ui.colored_label(
-                                    egui::Color32::YELLOW,
+                                    egui::Color32::DARK_GRAY,
                                     format!("⏳ 等待定时（{}）", format_left(p.waiting_left())),
                                 );
                             } else if p.is_stopped() {
@@ -456,7 +456,7 @@ impl MailApp {
                                 ));
                             } else {
                                 ui.colored_label(
-                                    egui::Color32::YELLOW,
+                                    egui::Color32::DARK_BLUE,
                                     format!(
                                         "选定时间 {} 已过，点击开始后会立即发送",
                                         t.format("%Y-%m-%d %H:%M:%S")
@@ -553,7 +553,7 @@ impl MailApp {
         // 定时等待阶段：进度条还没意义，展示倒计时
         if progress.is_waiting() {
             ui.colored_label(
-                egui::Color32::YELLOW,
+                egui::Color32::DARK_GRAY,
                 format!("⏳ 等待定时开始，剩余 {}", format_left(progress.waiting_left())),
             );
             ui.horizontal(|ui| {
