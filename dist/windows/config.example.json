@@ -1,0 +1,34 @@
+{
+  "_说明": [
+    "用法：把本文件复制/改名为 config.json，与 mail_sender.exe 放在同一目录，程序启动时读取，保存设置时写回。",
+    "accounts：SMTP 账号列表，可配置多个，发送时按顺序轮换使用；port=465 一般 ssl=true，port=587 一般 ssl=false。",
+    "interval_min_sec / interval_max_sec：每封邮件之间的随机间隔（秒），实际间隔在该区间内随机取值；填 0 表示不等待。若 min > max，程序会自动交换并提示。",
+    "interval_sec：旧版字段，仅当上面两个字段缺失时作为固定间隔使用（默认 20）。",
+    "split_mb：7z 分卷大小（MB），默认 10，最小 1。",
+    "sevenz_password：7z 压缩密码，默认 123456；留空则不加密（同时不设置 -mhe）。",
+    "schedule_enabled / schedule_start：【旧版字段，已废弃】定时开始现在是发送页里每次发送的一次性选项，不再写在配置里；旧配置若为 true，程序启动时会忽略它（只把时间预填到发送页控件）并记录一条迁移日志。",
+    "history：收件人历史（界面下拉框用），max 为保留条数。"
+  ],
+  "accounts": [
+    {
+      "id": "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "name": "示例账号（可删除）",
+      "smtp": "smtp.example.com",
+      "port": 465,
+      "username": "user@example.com",
+      "password": "请填写授权码",
+      "ssl": true
+    }
+  ],
+  "interval_sec": 20,
+  "interval_min_sec": 15,
+  "interval_max_sec": 30,
+  "split_mb": 10,
+  "sevenz_password": "123456",
+  "schedule_enabled": false,
+  "schedule_start": "",
+  "history": {
+    "max": 10,
+    "recipients": []
+  }
+}

@@ -91,11 +91,16 @@ pub struct AppConfig {
     #[serde(default = "default_sevenz_password")]
     pub sevenz_password: String,
 
-    /// 是否启用「定时开始发送」
+    /// 【已废弃】旧版「全局定时开始」开关。
+    ///
+    /// 新语义下定时是每次发送的一次性属性，不再持久化。该字段仅为兼容旧
+    /// 配置文件而保留：加载时若为 true，程序会记录一条迁移日志、预填时间
+    /// 控件并把它改写为 false，不会自动启用定时。
     #[serde(default)]
     pub schedule_enabled: bool,
 
-    /// 定时开始时间（本地时间），支持 "YYYY-MM-DD HH:MM:SS" 或 "YYYY-MM-DD HH:MM"
+    /// 旧版定时开始时间字符串（本地时间），支持 "YYYY-MM-DD HH:MM:SS" 或
+    /// "YYYY-MM-DD HH:MM"。仅用作时间选择控件的初始值提示，不再直接驱动发送。
     #[serde(default)]
     pub schedule_start: String,
 

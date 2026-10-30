@@ -22,12 +22,15 @@ use crate::sevenz::{split_if_needed, cleanup_parts};
 /// 发送主入口（由 app.rs 在后台线程中调用）
 ///
 /// 该函数整体运行在后台线程，因此定时等待也不会阻塞 UI 线程。
+/// `schedule_at` 是本次发送的一次性定时开始时间（None 表示立即发送），
+/// 不读取 config 里的全局定时字段。
 pub fn start_send_task(
     files: &[PathBuf],
     to: &str,
     subject: &str,
     body: &str,
     config: &AppConfig,
+    schedule_at: Option<chrono::NaiveDateTime>,
     progress: Arc<SendProgress>,
     logger: Logger,
 ) {
@@ -53,7 +56,7 @@ pub fn start_send_task(
     }
 
     // 定时开始：在后台线程内等待，UI / 日志线程不受影响
-    if !wait_until_start(config, &progress, &logger) {
+    if !wait_until_start(schedule_at, &progress, &logger) {
         logger.warn("定时等待被终止或配置非法，任务结束");
         progress.mark_finished();
         return;
@@ -168,15 +171,15 @@ pub fn start_send_task(
     progress.mark_finished();
 }
 
-/// 等待定时开始时间；返回 false 表示被终止或配置非法
-fn wait_until_start(config: &AppConfig, progress: &SendProgress, logger: &Logger) -> bool {
-    let target = match config.parse_schedule_start() {
-        Ok(Some(t)) => t,
-        Ok(None) => return true,
-        Err(e) => {
-            logger.error(format!("定时开始配置无效: {}", e));
-            return false;
-        }
+/// 等待定时开始时间；返回 false 表示被终止
+fn wait_until_start(
+    schedule_at: Option<chrono::NaiveDateTime>,
+    progress: &SendProgress,
+    logger: &Logger,
+) -> bool {
+    let target = match schedule_at {
+        Some(t) => t,
+        None => return true,
     };
 
     let fmt = "%Y-%m-%d %H:%M:%S";
@@ -391,21 +394,16 @@ mod tests {
     }
 
     /// 定时开始：设置 ~3 秒后开始，验证确实会等待到点
-    ///
-    /// 时间字符串只精确到秒，所以实际等待时间在 [2, 4] 秒之间。
     #[test]
     fn wait_until_start_sleeps_until_target() {
-        let mut cfg = AppConfig::default();
-        cfg.schedule_enabled = true;
         let target =
             chrono::Local::now().naive_local() + chrono::Duration::seconds(3);
-        cfg.schedule_start = target.format("%Y-%m-%d %H:%M:%S").to_string();
 
         let progress = SendProgress::new(1);
         let logger = Logger::new(10);
 
         let started = Instant::now();
-        assert!(wait_until_start(&cfg, &progress, &logger));
+        assert!(wait_until_start(Some(target), &progress, &logger));
         let elapsed = started.elapsed().as_secs_f64();
 
         assert!(
@@ -418,11 +416,8 @@ mod tests {
     /// 定时等待期间点击「停止」应立即返回，不需要等到目标时间
     #[test]
     fn wait_until_start_aborts_when_stopped() {
-        let mut cfg = AppConfig::default();
-        cfg.schedule_enabled = true;
         let target =
             chrono::Local::now().naive_local() + chrono::Duration::hours(1);
-        cfg.schedule_start = target.format("%Y-%m-%d %H:%M:%S").to_string();
 
         let progress = SendProgress::new(1);
         progress
@@ -431,9 +426,19 @@ mod tests {
         let logger = Logger::new(10);
 
         let started = Instant::now();
-        assert!(!wait_until_start(&cfg, &progress, &logger));
+        assert!(!wait_until_start(Some(target), &progress, &logger));
         assert!(started.elapsed().as_secs() < 2, "停止未能及时生效");
         assert!(!progress.is_waiting());
+    }
+
+    /// 无定时：立即返回
+    #[test]
+    fn wait_until_start_none_returns_immediately() {
+        let progress = SendProgress::new(1);
+        let logger = Logger::new(10);
+        let started = Instant::now();
+        assert!(wait_until_start(None, &progress, &logger));
+        assert!(started.elapsed().as_millis() < 500);
     }
 
     /// 可中断间隔等待：到点前被停止则提前返回

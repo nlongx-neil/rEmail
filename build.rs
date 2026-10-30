@@ -1,5 +1,6 @@
 use std::env;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -24,6 +25,7 @@ fn main() {
 }
 
 fn embed_windows_icon() {
+    // 构建主机是 Windows：走 winres（内部会调用 rc.exe 或 windres）
     #[cfg(windows)]
     {
         let mut res = winres::WindowsResource::new();
@@ -36,10 +38,77 @@ fn embed_windows_icon() {
         }
     }
 
-    // 在非 Windows 主机上交叉编译到 Windows 时无法调用 windres，
-    // 需要在 Windows 上构建，或构建后用 rcedit 手动写入图标。
+    // 构建主机非 Windows（如 macOS/Linux 交叉编译到 Windows）：显式调用 mingw 的
+    // windres 生成 COFF 资源对象，再通过 rustc-link-arg 交给链接器，确保图标/版本信息真的嵌进去。
     #[cfg(not(windows))]
-    println!("cargo:warning=当前构建主机非 Windows，跳过 exe 图标嵌入（请在 Windows 上构建或使用 rcedit）");
+    cross_compile_windows_icon();
+}
+
+#[cfg(not(windows))]
+fn cross_compile_windows_icon() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let icon = manifest.join("assets").join("icon.ico");
+    if !icon.exists() {
+        panic!("交叉编译嵌入图标失败：{} 不存在", icon.display());
+    }
+
+    let rc_path = out_dir.join("mail_sender.rc");
+    let rc = format!(
+        "1 ICON \"{icon}\"\n\
+         1 VERSIONINFO\n\
+         FILEVERSION 0,1,0,0\n\
+         PRODUCTVERSION 0,1,0,0\n\
+         FILEFLAGSMASK 0x3fL\n\
+         FILEFLAGS 0x0L\n\
+         FILEOS 0x40004L\n\
+         FILETYPE 0x1L\n\
+         FILESUBTYPE 0x0L\n\
+         BEGIN\n\
+         \x20 BLOCK \"StringFileInfo\"\n\
+         \x20 BEGIN\n\
+         \x20   BLOCK \"040904b0\"\n\
+         \x20   BEGIN\n\
+         \x20     VALUE \"FileDescription\", \"MailSender\"\n\
+         \x20     VALUE \"FileVersion\", \"0.1.0.0\"\n\
+         \x20     VALUE \"ProductName\", \"MailSender\"\n\
+         \x20     VALUE \"ProductVersion\", \"0.1.0.0\"\n\
+         \x20     VALUE \"OriginalFilename\", \"mail_sender.exe\"\n\
+         \x20   END\n\
+         \x20 END\n\
+         \x20 BLOCK \"VarFileInfo\"\n\
+         \x20 BEGIN\n\
+         \x20   VALUE \"Translation\", 0x409, 1200\n\
+         \x20 END\n\
+         END\n",
+        icon = icon.display().to_string().replace('\\', "/")
+    );
+    fs::write(&rc_path, rc).expect("写入 .rc 失败");
+
+    let windres = env::var("WINDRES")
+        .or_else(|_| env::var("WINDRES_x86_64_pc_windows_gnu"))
+        .unwrap_or_else(|_| "x86_64-w64-mingw32-windres".to_string());
+    let obj = out_dir.join("mail_sender_res.o");
+
+    let status = Command::new(&windres)
+        .arg("-O")
+        .arg("coff")
+        .arg(format!("--include-dir={}", manifest.display()))
+        .arg(&rc_path)
+        .arg("-o")
+        .arg(&obj)
+        .status();
+
+    match status {
+        Ok(s) if s.success() && obj.exists() => {
+            println!("cargo:rustc-link-arg-bins={}", obj.display());
+            println!("cargo:warning=已用 {} 嵌入 Windows 图标与版本信息", windres);
+        }
+        Ok(s) => panic!("交叉编译嵌入图标失败：windres 退出码 {}", s.code().unwrap_or(-1)),
+        Err(e) => panic!(
+            "交叉编译嵌入图标失败：无法执行 {windres}（{e}）。请安装 mingw-w64（或设置 WINDRES 指向 x86_64-w64-mingw32-windres）"
+        ),
+    }
 }
 
 fn compress_with_upx(target: &str) {
