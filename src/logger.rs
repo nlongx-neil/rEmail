@@ -10,19 +10,10 @@ pub enum LogLevel {
     Error,
 }
 
-impl LogLevel {
-    fn as_str(&self) -> &'static str {
-        match self {
-            LogLevel::Info => "INFO",
-            LogLevel::Warn => "WARN",
-            LogLevel::Error => "ERROR",
-        }
-    }
-}
-
 /// 单条日志
 #[derive(Clone)]
 pub struct LogItem {
+    /// 记录时间（HH:MM:SS，发送页日志区显示用）
     pub time: String,
     pub level: LogLevel,
     pub message: String,
@@ -44,21 +35,11 @@ impl Logger {
         }
     }
 
-    /// 清空日志（开始一次新发送任务时调用）
-    pub fn clear(&self) {
-        self.inner.lock().clear();
-    }
-
-    /// 获取当前日志快照（给 egui 用）
-    pub fn snapshot(&self) -> Vec<LogItem> {
-        self.inner.lock().clone()
-    }
-
     fn push(&self, level: LogLevel, msg: impl Into<String>) {
         let mut logs = self.inner.lock();
 
         logs.push(LogItem {
-            time: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            time: Local::now().format("%H:%M:%S").to_string(),
             level,
             message: msg.into(),
         });
@@ -83,6 +64,8 @@ impl Logger {
     pub fn error(&self, msg: impl Into<String>) {
         self.push(LogLevel::Error, msg);
     }
+
+    /// 当前日志快照（UI 渲染用）
     pub fn entries(&self) -> Vec<LogItem> {
         self.inner.lock().clone()
     }

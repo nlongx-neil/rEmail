@@ -158,25 +158,20 @@ impl AppConfig {
         }
     }
 
-    /// 保存配置到磁盘
-    pub fn save(&self) {
+    /// 保存配置到磁盘；失败时返回可展示的错误信息（由调用方写日志/提示）
+    pub fn save(&self) -> Result<(), String> {
         let path = Self::config_path();
 
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
-        let json = match serde_json::to_string_pretty(self) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("配置序列化失败: {e}");
-                return;
+            if let Err(e) = fs::create_dir_all(parent) {
+                return Err(format!("创建配置目录失败: {e}"));
             }
-        };
-
-        if let Err(e) = fs::write(&path, json) {
-            eprintln!("保存配置失败: {e}");
         }
+
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("配置序列化失败: {e}"))?;
+
+        fs::write(&path, json).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
     }
 
     /// 修正非法/缺失的配置项，返回被修正项的说明（用于写日志）

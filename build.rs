@@ -15,11 +15,8 @@ fn main() {
     }
 
     // 仅发布构建 + Windows 时用 UPX 压缩（UPX 只处理 PE，其他平台跳过）
-    if env::var("PROFILE").unwrap_or_default() == "release" {
-        if !is_windows {
-            println!("cargo:warning=非 Windows 目标，跳过 UPX 压缩");
-            return;
-        }
+    // 非 Windows 直接跳过，不打印 warning，保证普通构建零警告
+    if env::var("PROFILE").unwrap_or_default() == "release" && is_windows {
         compress_with_upx(&target);
     }
 }
@@ -102,7 +99,8 @@ fn cross_compile_windows_icon() {
     match status {
         Ok(s) if s.success() && obj.exists() => {
             println!("cargo:rustc-link-arg-bins={}", obj.display());
-            println!("cargo:warning=已用 {} 嵌入 Windows 图标与版本信息", windres);
+            // 进度信息，仅 -vv 时可见；不用 cargo:warning 以免构建输出出现警告
+            println!("已用 {} 嵌入 Windows 图标与版本信息", windres);
         }
         Ok(s) => panic!("交叉编译嵌入图标失败：windres 退出码 {}", s.code().unwrap_or(-1)),
         Err(e) => panic!(
@@ -134,14 +132,14 @@ fn compress_with_upx(target: &str) {
         None => return,
     };
 
-    println!("cargo:warning=正在检查可执行文件: {}", exe_path.display());
+    println!("正在检查可执行文件: {}", exe_path.display());
 
     if !exe_path.exists() {
-        println!("cargo:warning=未找到可执行文件: {}", exe_path.display());
+        println!("未找到可执行文件: {}，跳过 UPX", exe_path.display());
         return;
     }
 
-    println!("cargo:warning=正在使用UPX压缩可执行文件...");
+    println!("正在使用 UPX 压缩可执行文件...");
     let status = Command::new("upx")
         .arg("--best")
         .arg("--lzma")
@@ -150,13 +148,11 @@ fn compress_with_upx(target: &str) {
 
     match status {
         Ok(s) if s.success() => {
-            println!("cargo:warning=UPX压缩成功");
+            println!("UPX 压缩成功");
             let _ = Command::new("upx").arg("-l").arg(&exe_path).status();
         }
-        Ok(s) => println!("cargo:warning=UPX压缩失败，退出码: {}", s),
-        Err(e) => {
-            println!("cargo:warning=UPX未安装或无法运行: {}", e);
-            println!("cargo:warning=请安装UPX: https://upx.github.io/");
-        }
+        // UPX 是可选的体积优化：失败/未安装都不影响产物可用性，只做提示
+        Ok(s) => println!("UPX 压缩失败，退出码 {}，跳过", s),
+        Err(e) => println!("UPX 未安装或无法运行（{e}），跳过压缩"),
     }
 }

@@ -184,17 +184,18 @@ fn wait_until_start(
 
     let fmt = "%Y-%m-%d %H:%M:%S";
     let now = chrono::Local::now().naive_local();
-    let initial_left = (target - now).num_seconds();
-    if initial_left <= 0 {
+    // 直接比较时间点：num_seconds() 会截断不到 1 秒的差值，导致提前 <=1 秒开始
+    if now >= target {
         logger.info(format!(
             "开始时间 {} 已到/已过，立即开始发送",
             target.format(fmt)
         ));
         return true;
     }
+    let initial_left = (target - now).num_seconds();
 
     logger.info(format!(
-        "已启用定时开始，等待至 {}（剩余 {} 秒），期间可点击「停止」取消",
+        "已启用定时开始，等待至 {}（剩余 {} 秒），期间可点击「取消等待」终止本次发送",
         target.format(fmt),
         initial_left
     ));
@@ -208,12 +209,12 @@ fn wait_until_start(
         }
 
         let now = chrono::Local::now().naive_local();
-        let left = (target - now).num_seconds();
-        if left <= 0 {
+        if now >= target {
             progress.clear_waiting();
             logger.info(format!("已到达定时开始时间 {}，开始发送", target.format(fmt)));
             return true;
         }
+        let left = (target - now).num_seconds();
 
         progress.set_waiting(left as u64);
 

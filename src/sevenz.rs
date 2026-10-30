@@ -33,11 +33,11 @@ pub fn split_if_needed(
     config: &AppConfig,
 ) -> io::Result<SevenZResult> {
     let meta = fs::metadata(input)?;
-    let size_mb = meta.len() / 1024 / 1024;
     let split_mb = config.split_mb.max(1);
+    // 用字节比较而不是「截断成 MB」，否则 10.9MB 文件会被误判为不需要分卷
 
     // 不需要分卷
-    if size_mb <= split_mb {
+    if !needs_split(meta.len(), split_mb) {
         return Ok(SevenZResult {
             parts: vec![input.to_path_buf()],
         });
@@ -50,6 +50,9 @@ pub fn split_if_needed(
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "非法文件名"))?;
 
     let output_7z = work_dir.join(format!("{}.7z", base_name));
+    let prefix = format!("{}.7z.", base_name);
+    // 先清掉上次中断残留的同名分卷，避免本次生成 3 个分卷却把旧的 004/005 一起发出去
+    remove_stale_parts(work_dir, &prefix);
 
     // 构造 7z 命令
     let mut cmd = Command::new(sevenz_path()?);
@@ -79,7 +82,6 @@ pub fn split_if_needed(
 
     // 查找生成的分卷文件
     let mut parts = Vec::new();
-    let prefix = format!("{}.7z.", base_name);
 
     for entry in fs::read_dir(work_dir)? {
         let entry = entry?;
@@ -91,8 +93,13 @@ pub fn split_if_needed(
         }
     }
 
-    // 按 001 / 002 排序
-    parts.sort();
+    // 按扩展名数字排序（.001/.002/…），避免字典型排序把 .010 排到 .002 前面
+    parts.sort_by_key(|p| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
 
     if parts.is_empty() {
         return Err(io::Error::new(
@@ -102,6 +109,23 @@ pub fn split_if_needed(
     }
 
     Ok(SevenZResult { parts })
+}
+
+/// 是否需要分卷：按字节精确比较（<= 阈值则直接发原文件）
+fn needs_split(size_bytes: u64, split_mb: u64) -> bool {
+    size_bytes > split_mb.max(1).saturating_mul(1024 * 1024)
+}
+
+/// 删除工作目录里上一次残留的同名分卷（发送前清理，避免旧分卷混入）
+fn remove_stale_parts(work_dir: &Path, prefix: &str) {
+    if let Ok(entries) = fs::read_dir(work_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(prefix) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// 隐藏子进程控制台窗口（仅 Windows 需要）
@@ -169,5 +193,21 @@ pub fn cleanup_parts(parts: &[PathBuf], original: &Path) {
         if p != original {
             let _ = fs::remove_file(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_threshold_uses_exact_bytes() {
+        let mb = 1024 * 1024;
+        // 恰好等于阈值：不分卷
+        assert!(!needs_split(10 * mb, 10));
+        // 10.9MB：原实现按 MB 截断成 10MB 会误判为不分卷
+        assert!(needs_split(10 * mb + mb * 9 / 10, 10));
+        // 0 / 非法阈值按 1MB 处理
+        assert!(needs_split(mb + 1, 0));
     }
 }

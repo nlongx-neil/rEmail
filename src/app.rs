@@ -54,10 +54,20 @@ pub struct MailApp {
     /// 本次发送任务实际使用了定时（用于结束后复位）
     schedule_used_this_run: bool,
 
+    /* ========== 日志区滚动跟随状态 ========== */
+    /// 是否自动跟随到日志底部（用户上滚/选中文本时暂停）
+    log_follow: bool,
+    /// 上一帧日志条数（判断是否出现新内容）
+    log_seen: usize,
+    /// 上一帧日志滚动偏移（判断是否用户手动滚动）
+    log_last_offset: f32,
+    /// 上一帧日志滚动区可视区域（判断鼠标是否在日志区内操作）
+    log_view_rect: Option<egui::Rect>,
+    /// 是否请求「回到底部」一次性跳转
+    log_jump: bool,
+
     /// 当前账号编辑缓存
     edit_account: Option<SmtpAccount>,
-    /// 当前账号编辑缓存的索引
-    edit_index: Option<usize>,
     /// 当前账号编辑缓存的 ID
     edit_account_id: Option<Uuid>,
 }
@@ -91,7 +101,8 @@ impl Default for MailApp {
                     .to_string(),
             );
             config.schedule_enabled = false;
-            config.save();
+            // 迁移写盘失败不阻塞启动，下一次保存会重试
+            let _ = config.save();
         }
 
         // 定时控件默认值：明天同一时间；若旧配置里有合法时间则预填
@@ -119,8 +130,12 @@ impl Default for MailApp {
             sched_date,
             sched_time,
             schedule_used_this_run: false,
+            log_follow: true,
+            log_seen: 0,
+            log_last_offset: 0.0,
+            log_view_rect: None,
+            log_jump: false,
             edit_account: None,
-            edit_index: None,
             edit_account_id: None,
         }
     }
@@ -156,7 +171,7 @@ impl eframe::App for MailApp {
                             if p.is_waiting() {
                                 ui.colored_label(
                                     egui::Color32::YELLOW,
-                                    format!("⏳ 等待定时开始（{}）", format_left(p.waiting_left())),
+                                    format!("⏳ 等待定时（{}）", format_left(p.waiting_left())),
                                 );
                             } else if p.is_stopped() {
                                 ui.colored_label(egui::Color32::RED, "正在停止…");
@@ -169,17 +184,27 @@ impl eframe::App for MailApp {
             });
         });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            match self.tab {
-                AppTab::Send => self.ui_send(ui),
-                AppTab::Settings => self.ui_settings(ui),
-            }
+        // 日志只在发送页展示：设置页不再显示日志面板
+        if self.tab == AppTab::Send {
+            egui::Panel::bottom("log_panel")
+                .resizable(true)
+                .default_size(190.0)
+                .size_range(120.0..=520.0)
+                .show(ui, |ui| self.ui_logs(ui));
+        }
 
-            ui.add_space(4.0);
-            self.ui_logs(ui);
+        egui::CentralPanel::default().show(ui, |ui| match self.tab {
+            AppTab::Send => self.ui_send(ui),
+            AppTab::Settings => self.ui_settings(ui),
         });
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // 只在需要刷新时请求重绘：发送中刷新进度/倒计时，发送页勾选定时后刷新预览；
+        // 空闲时不再固定每 200ms 重绘，避免无意义的 UI 空转。
+        if self.sending {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        } else if self.tab == AppTab::Send && self.sched_enabled {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 }
 
@@ -248,10 +273,12 @@ impl MailApp {
                 egui::Grid::new("send_fields").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                     ui.label("收件人");
                     ui.horizontal(|ui| {
+                        // 输入框宽度自适应：给右侧「历史」下拉预留约 130px
+                        let input_width = (ui.available_width() - 130.0).clamp(140.0, 420.0);
                         ui.add(
                             egui::TextEdit::singleline(&mut self.to)
                                 .hint_text("多个收件人用英文逗号分隔")
-                                .desired_width(320.0),
+                                .desired_width(input_width),
                         );
                         egui::ComboBox::from_id_salt("recipient_history")
                             .width(120.0)
@@ -295,7 +322,7 @@ impl MailApp {
 
             // ---------- ③ 发送选项 ----------
             section(ui, "③ 发送选项", |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("每封邮件随机间隔");
                     let mut min = self.config.interval_min_sec.unwrap_or(self.config.interval_sec);
                     let mut max = self
@@ -345,7 +372,7 @@ impl MailApp {
                 ui.checkbox(&mut self.sched_enabled, "⏰ 定时开始（仅本次发送有效）");
 
                 ui.add_enabled_ui(self.sched_enabled, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("开始时间");
                         ui.add(
                             egui::DragValue::new(&mut self.sched_date.0)
@@ -372,8 +399,9 @@ impl MailApp {
 
                     match self.schedule_target() {
                         Ok(t) => {
-                            let left = (t - chrono::Local::now().naive_local()).num_seconds();
-                            if left > 0 {
+                            let now = chrono::Local::now().naive_local();
+                            let left = (t - now).num_seconds();
+                            if t > now {
                                 ui.label(format!(
                                     "将于 {} 开始（剩余 {}）",
                                     t.format("%Y-%m-%d %H:%M:%S"),
@@ -525,8 +553,8 @@ impl MailApp {
         let schedule_at = if self.sched_enabled {
             match self.schedule_target() {
                 Ok(t) => {
-                    let left = (t - chrono::Local::now().naive_local()).num_seconds();
-                    if left > 0 {
+                    // 用直接比较而非 num_seconds()，避免「还差不到 1 秒」被当成已过
+                    if t > chrono::Local::now().naive_local() {
                         Some(t)
                     } else {
                         self.logger.warn(format!(
@@ -599,7 +627,7 @@ impl MailApp {
                         self.edit_account_id = None;
                         self.edit_account = None;
                     }
-                    self.config.save();
+                    self.save_config();
                 }
 
                 if ui.button("➕ 添加账号").clicked() {
@@ -619,7 +647,6 @@ impl MailApp {
 
                 // ===== 进入编辑态（UI 后处理）=====
                 if let Some((idx, acc)) = start_edit {
-                    self.edit_index = idx;
                     // 必须记录被编辑账号的 ID，否则保存时会被当成「新增」而重复插入账号
                     self.edit_account_id = if idx.is_some() { Some(acc.id) } else { None };
                     self.edit_account = Some(acc);
@@ -682,14 +709,12 @@ impl MailApp {
                                     self.config.accounts.push(acc);
                                 }
                             }
-                            self.config.save();
+                            self.save_config();
                         }
-                        self.edit_index = None;
                         self.edit_account_id = None;
                     }
                     AccountEditAction::Cancel => {
                         self.edit_account = None;
-                        self.edit_index = None;
                         self.edit_account_id = None;
                     }
                 }
@@ -724,32 +749,99 @@ impl MailApp {
                 for note in self.config.normalize() {
                     self.logger.warn(format!("配置已修正: {}", note));
                 }
-                self.config.save();
-                self.logger.info("配置已保存");
+                self.save_config();
             }
         });
     }
 
+    /// 保存配置并把失败原因写进日志（不再静默吞掉写盘错误）
+    fn save_config(&mut self) {
+        match self.config.save() {
+            Ok(()) => self.logger.info("配置已保存"),
+            Err(e) => self.logger.error(format!("保存配置失败: {e}")),
+        }
+    }
+
     /* =================== 日志区 =================== */
 
-    fn ui_logs(&self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("运行日志")
-            .default_open(true)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(160.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for log in self.logger.entries() {
-                            let color = match log.level {
-                                LogLevel::Info => egui::Color32::LIGHT_GREEN,
-                                LogLevel::Warn => egui::Color32::YELLOW,
-                                LogLevel::Error => egui::Color32::RED,
-                            };
-                            ui.colored_label(color, &log.message);
-                        }
-                    });
+    fn ui_logs(&mut self, ui: &mut egui::Ui) {
+        let entries = self.logger.entries();
+        let has_new = entries.len() > self.log_seen;
+
+        // 鼠标按住且位于日志滚动区内（拖动滚动条 / 选中文本）时，本帧不抢滚动
+        let pointer_busy = ui.ctx().input(|i| i.pointer.any_down())
+            && self.log_view_rect.is_some_and(|r| {
+                ui.ctx()
+                    .input(|i| i.pointer.interact_pos().is_some_and(|p| r.contains(p)))
             });
+
+        ui.horizontal(|ui| {
+            ui.strong("运行日志");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !self.log_follow {
+                    ui.colored_label(egui::Color32::YELLOW, "已暂停自动跟随");
+                    if ui
+                        .button("⤓ 回到底部")
+                        .on_hover_text("恢复自动滚动到最新日志")
+                        .clicked()
+                    {
+                        self.log_follow = true;
+                        self.log_jump = true;
+                    }
+                }
+            });
+        });
+
+        // 只有「跟随中且有新内容」或用户点了「回到底部」时才滚动一次，
+        // 每帧无条件贴底会把用户正在查看的历史日志抢走
+        let stick = ((self.log_follow && has_new) || self.log_jump) && !pointer_busy;
+
+        let out = egui::ScrollArea::vertical()
+            .id_salt("log_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for log in &entries {
+                    let color = match log.level {
+                        LogLevel::Info => egui::Color32::LIGHT_GREEN,
+                        LogLevel::Warn => egui::Color32::YELLOW,
+                        LogLevel::Error => egui::Color32::RED,
+                    };
+                    ui.colored_label(color, format!("[{}] {}", log.time, log.message));
+                }
+                if stick {
+                    ui.scroll_to_cursor_animation(
+                        Some(egui::Align::BOTTOM),
+                        egui::style::ScrollAnimation::none(),
+                    );
+                }
+            });
+
+        // 用实际滚动偏移判断用户是否在查看历史：
+        // - 用户自己把位置移到/移回底部 → 暂停 / 恢复跟随
+        // - 鼠标按住日志区（选中文本/拖动） → 暂停跟随
+        let max_offset = (out.content_size.y - out.inner_rect.height()).max(0.0);
+        let offset = out.state.clamped_offset().y;
+        let at_bottom = max_offset - offset <= 1.0;
+        let offset_changed = (offset - self.log_last_offset).abs() > 0.5;
+        // 内容不足一屏时永远视为「在底部」
+        let fits = max_offset <= 0.0;
+
+        if fits || self.log_jump {
+            self.log_follow = true;
+        } else if offset_changed {
+            // 用户自己把滚动位置移到了底部 → 恢复跟随；移到中间 → 暂停
+            self.log_follow = at_bottom;
+        }
+        // 鼠标按住日志区（拖滚动条 / 选中文本）期间一律暂停跟随，
+        // 松开后保持暂停，直到用户滚回底部或点「回到底部」
+        if pointer_busy {
+            self.log_follow = false;
+        }
+
+        self.log_jump = false;
+        self.log_last_offset = offset;
+        self.log_seen = entries.len();
+        self.log_view_rect = Some(out.inner_rect);
     }
 }
 

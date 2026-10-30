@@ -17,8 +17,9 @@ fn main() -> Result<(), eframe::Error> {
     // 窗口图标（128x128 PNG，来自 assets/，构建时嵌入二进制）
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Mail Sender")
-        .with_inner_size([1100.0, 760.0])
-        .with_min_inner_size([900.0, 600.0]);
+        // 宽度为原值 1100 / 900 的 60%（660 / 540）；高度保持 760 / 600
+        .with_inner_size([660.0, 760.0])
+        .with_min_inner_size([540.0, 600.0]);
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
     }
