@@ -16,7 +16,7 @@ use crate::schedule;
 use crate::sender::start_send_task;
 
 /// 主窗口底部状态条高度（只放一行：最新日志 + 计数 + 打开日志按钮）
-const STATUS_BAR_HEIGHT: f32 = 28.0;
+const STATUS_BAR_HEIGHT: f32 = 30.0;
 
 /// 日志窗口初始尺寸 / 最小尺寸
 const LOG_WINDOW_SIZE: [f32; 2] = [720.0, 520.0];
@@ -262,15 +262,17 @@ impl eframe::App for MailApp {
 
         // 只在需要刷新时请求重绘：发送中刷新进度/倒计时/日志窗口，发送页勾选定时后刷新预览；
         // 空闲时不再固定每 200ms 重绘，避免无意义的 UI 空转。
+        if self.log_open.load(Ordering::Relaxed) {
+            // 后台线程写日志不会唤醒 UI：只要日志条数比日志窗口上次渲染的多，
+            // 就主动唤醒子窗口一次（发送中每 200ms 一次，空闲时只在真有新日志时触发）
+            let seen = self.log_ui.lock().seen;
+            if self.logger.len() > seen {
+                ctx.request_repaint_of(log_viewport_id());
+            }
+        }
+
         if self.sending {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
-            if self.log_open.load(Ordering::Relaxed) {
-                // 后台线程写日志不会唤醒 UI，这里按节奏唤醒日志子窗口
-                ctx.request_repaint_after_for(
-                    std::time::Duration::from_millis(200),
-                    log_viewport_id(),
-                );
-            }
         } else if self.tab == AppTab::Send && self.sched_enabled {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }

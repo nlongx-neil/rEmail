@@ -65,6 +65,11 @@ impl Logger {
         self.push(LogLevel::Error, msg);
     }
 
+    /// 当前日志条数（判断日志窗口是否需要刷新，避免克隆整个列表）
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+
     /// 当前日志快照（UI 渲染用）
     pub fn entries(&self) -> Vec<LogItem> {
         self.inner.lock().clone()
