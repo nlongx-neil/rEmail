@@ -23,6 +23,9 @@ const STATUS_BAR_HEIGHT: f32 = 30.0;
 const TOP_BAR_HEIGHT: f32 = 56.0;
 /// 顶栏分段控件宽度
 const TAB_SWITCH_WIDTH: f32 = 148.0;
+/// 列表行固定高度：不随窗口高度变化（内容多时靠省略 + hover，而不是拉高整行）
+const ATTACHMENT_ROW_HEIGHT: f32 = 36.0;
+const ACCOUNT_ROW_HEIGHT: f32 = 40.0;
 
 /// 日志窗口初始尺寸 / 最小尺寸
 const LOG_WINDOW_SIZE: [f32; 2] = [720.0, 520.0];
@@ -561,9 +564,13 @@ impl MailApp {
                     }
                 } else {
                     let mut remove: Option<usize> = None;
+                    // 视口高度随窗口高度增长（约主窗口的 28%），但行高固定：
+                    // 窗口变高时多出来的空间留给列表可视区域，而不是某一行的条目
+                    let list_height =
+                        (ui.ctx().content_rect().height() * 0.28).clamp(120.0, 280.0);
                     egui::ScrollArea::vertical()
                         .id_salt("attachment_list")
-                        .max_height(190.0)
+                        .max_height(list_height)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             for (i, f) in self.files.iter().enumerate() {
@@ -759,16 +766,34 @@ impl MailApp {
                         ui.label(egui::RichText::new("开始").size(12.0).color(p.text_secondary));
                         edited |= date_drag(ui, &mut self.sched_date);
                         edited |= time_drag(ui, &mut self.sched_time);
-                        ui.add_space(theme::SPACE_XS);
-                        if button(ui, BtnKind::Ghost, None, "-10 分钟").clicked() {
-                            self.shift_schedule(Duration::minutes(-10));
-                        }
-                        if button(ui, BtnKind::Ghost, None, "-5 分钟").clicked() {
-                            self.shift_schedule(Duration::minutes(-5));
-                        }
-                        if button(ui, BtnKind::Ghost, None, "+10 分钟").clicked() {
-                            self.shift_schedule(Duration::minutes(10));
-                        }
+                    });
+                    // 快捷调整：左侧整体回退、右侧整体前进，均复用 shift_schedule（跨天自动进位）
+                    // 窄窗口（540px）下 horizontal_wrapped 自动折成两行，不会挤出边界
+                    ui.add_space(theme::SPACE_XS);
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, minutes) in [
+                                ("-1 小时", -60_i64),
+                                ("-30 分钟", -30),
+                                ("-10 分钟", -10),
+                                ("-5 分钟", -5),
+                            ] {
+                                if button(ui, BtnKind::Ghost, None, label).clicked() {
+                                    self.shift_schedule(Duration::minutes(minutes));
+                                }
+                            }
+                            ui.add_space(theme::SPACE_SM);
+                            for (label, minutes) in [
+                                ("+10 分钟", 10_i64),
+                                ("+30 分钟", 30),
+                                ("+1 小时", 60),
+                            ] {
+                                if button(ui, BtnKind::Ghost, None, label).clicked() {
+                                    self.shift_schedule(Duration::minutes(minutes));
+                                }
+                            }
+                        });
                     });
                 });
                 if edited {
@@ -2513,6 +2538,17 @@ fn type_badge(ui: &mut egui::Ui, path: &std::path::Path) {
     );
 }
 
+/// 固定高度的水平行。
+/// 不能用 `ui.horizontal_centered()`：它内部用 `available_size_before_wrap()` 预留空间，
+/// 在 ScrollArea 里可用高度等于整个可视高度，会导致第一行被纵向撑满。
+fn fixed_row(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        add,
+    );
+}
+
 /// 单个附件行：类型徽标 + 文件名 + 体积 + 删除（不显示绝对路径）
 fn attachment_row(ui: &mut egui::Ui, path: &std::path::Path) -> bool {
     let p = theme::palette(ui);
@@ -2528,7 +2564,7 @@ fn attachment_row(ui: &mut egui::Ui, path: &std::path::Path) -> bool {
             bottom: 5,
         })
         .show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
+            fixed_row(ui, ATTACHMENT_ROW_HEIGHT - 10.0, |ui| {
                 type_badge(ui, path);
                 ui.add_space(theme::SPACE_SM);
 
@@ -2576,11 +2612,11 @@ fn account_row(ui: &mut egui::Ui, acc: &SmtpAccount) -> Option<AccountRowAction>
         .inner_margin(egui::Margin {
             left: 10,
             right: 6,
-            top: 7,
-            bottom: 7,
+            top: 6,
+            bottom: 6,
         })
         .show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
+            fixed_row(ui, ACCOUNT_ROW_HEIGHT - 12.0, |ui| {
                 // 首字符头像
                 let (avatar_rect, _) =
                     ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());

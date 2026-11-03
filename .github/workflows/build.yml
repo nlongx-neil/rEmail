@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  # Windows 原生构建（MSVC）：由 build.rs 通过 winres 把 assets/icon.ico 与版本信息嵌入 exe
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MailSender-windows-x64
+          path: target/release/mail_sender.exe
+          if-no-files-found: error
+
+  # macOS 通用包（Intel + Apple Silicon），由 tools/package_macos.sh 产出 .app 与 .dmg
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: ./tools/package_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MailSender-macos-universal
+          path: |
+            dist/MailSender.app
+            dist/MailSender-*-universal.dmg
+          if-no-files-found: error
