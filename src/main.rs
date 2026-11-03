@@ -8,6 +8,7 @@ mod progress;
 mod schedule;
 mod sender;
 mod sevenz;
+mod theme;
 
 use app::MailApp;
 use eframe::egui;
@@ -17,7 +18,7 @@ use std::fs;
 fn main() -> Result<(), eframe::Error> {
     // 窗口图标（128x128 PNG，来自 assets/，构建时嵌入二进制）
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Mail Sender")
+        .with_title("MailSender")
         // 宽度为原值 1100 / 900 的 60%（660 / 540）；高度保持 760 / 600
         .with_inner_size([660.0, 760.0])
         .with_min_inner_size([540.0, 600.0]);
@@ -28,6 +29,8 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport,
         centered: true,
+        // 记忆窗口尺寸/位置（依赖 eframe 的 persistence feature）
+        persist_window: true,
         // 0.37 默认渲染后端改为 wgpu，这里显式指定 glow（OpenGL），
         // 保持与 0.27 时期相同的渲染路径，避免老机器驱动差异
         renderer: eframe::Renderer::Glow,
@@ -35,11 +38,13 @@ fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "Mail Sender",
+        "MailSender",
         options,
         Box::new(|cc| {
             // 使用系统中文字体，避免中文乱码
             setup_font(&cc.egui_ctx);
+            // 品牌主题：深浅两套配色 + 统一间距/字号/圆角
+            theme::apply(&cc.egui_ctx);
 
             Ok(Box::new(MailApp::default()) as Box<dyn eframe::App>)
         }),

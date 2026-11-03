@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use eframe::egui;
@@ -14,13 +15,50 @@ use crate::logger::{LogLevel, LogItem, Logger};
 use crate::progress::SendProgress;
 use crate::schedule;
 use crate::sender::start_send_task;
+use crate::theme;
 
 /// 主窗口底部状态条高度（只放一行：最新日志 + 计数 + 打开日志按钮）
 const STATUS_BAR_HEIGHT: f32 = 30.0;
+/// 顶栏高度（品牌区 + 分段控件）
+const TOP_BAR_HEIGHT: f32 = 56.0;
+/// 顶栏分段控件宽度
+const TAB_SWITCH_WIDTH: f32 = 148.0;
 
 /// 日志窗口初始尺寸 / 最小尺寸
 const LOG_WINDOW_SIZE: [f32; 2] = [720.0, 520.0];
 const LOG_WINDOW_MIN_SIZE: [f32; 2] = [480.0, 320.0];
+/// 主窗口窄于此宽度时，日志改为内嵌页（不弹第二个 OS 窗口）
+const LOG_INLINE_MAX_WIDTH: f32 = 760.0;
+
+/// 日志等级筛选（日志窗口顶部）
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum LogFilter {
+    /// 全部
+    #[default]
+    All,
+    /// 仅 WARN 及以上
+    Warn,
+    /// 仅 ERROR
+    Error,
+}
+
+impl LogFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部",
+            Self::Warn => "警告+",
+            Self::Error => "仅错误",
+        }
+    }
+
+    fn accepts(self, level: LogLevel) -> bool {
+        match self {
+            Self::All => true,
+            Self::Warn => level != LogLevel::Info,
+            Self::Error => level == LogLevel::Error,
+        }
+    }
+}
 
 /// 日志视图的滚动跟随状态（主窗口状态条与日志窗口共用同一份）
 #[derive(Default)]
@@ -35,14 +73,66 @@ struct LogUiState {
     view_rect: Option<egui::Rect>,
     /// 是否请求「回到底部」一次性跳转
     jump: bool,
+    /// 等级筛选
+    filter: LogFilter,
 }
 
 impl LogUiState {
     fn new() -> Self {
         Self {
             follow: true,
+            filter: LogFilter::All,
             ..Default::default()
         }
+    }
+}
+
+/// ETA 估算：按已发送分卷的平均耗时推算剩余分卷
+#[derive(Default)]
+struct EtaTracker {
+    start: Option<Instant>,
+    /// 上一个文件索引
+    file: u64,
+    /// 上一个文件已发送分卷数
+    sent: u64,
+    /// 已完成（之前文件）的分卷累计
+    done_parts: u64,
+}
+
+impl EtaTracker {
+    /// 新建发送任务时重置
+    fn reset(&mut self) {
+        self.start = Some(Instant::now());
+        self.file = 0;
+        self.sent = 0;
+        self.done_parts = 0;
+    }
+
+    /// 估算剩余秒数；样本不足时返回 None
+    fn update(&mut self, p: &SendProgress) -> Option<u64> {
+        let file = p.current_file_index.load(Ordering::Relaxed);
+        let sent = p.current_file_sent_parts.load(Ordering::Relaxed);
+
+        if file != self.file {
+            if self.file > 0 {
+                self.done_parts += self.sent;
+            }
+            self.file = file;
+        }
+        self.sent = sent;
+
+        let start = self.start?;
+        let done = self.done_parts + sent;
+        let elapsed = start.elapsed().as_secs_f64();
+        if done == 0 || elapsed < 0.5 {
+            return None;
+        }
+
+        let per_part = elapsed / done as f64;
+        let total_parts = p.current_file_total_parts.load(Ordering::Relaxed).max(1);
+        let left_parts = total_parts.saturating_sub(sent)
+            + total_parts * p.total_files.saturating_sub(file);
+        Some((per_part * left_parts as f64).round() as u64)
     }
 }
 
@@ -112,17 +202,36 @@ pub struct MailApp {
     edit_account: Option<SmtpAccount>,
     /// 当前账号编辑缓存的 ID
     edit_account_id: Option<Uuid>,
+    /// 待删除账号的下标（弹确认框）
+    pending_delete: Option<usize>,
+
+    /// 账号密码是否明文显示
+    show_password: bool,
+    /// 7z 压缩密码是否明文显示
+    show_sevenz_password: bool,
+
+    /// 发送耗时 / ETA
+    eta: EtaTracker,
+
+    /// 品牌 logo 纹理（来自 assets/icon_64.png，首次渲染时懒加载）
+    logo_tex: Option<egui::TextureHandle>,
+
+    /// 日志是否以内嵌页显示（窄窗口 / 660px 默认宽度下不再弹第二个 OS 窗口）
+    log_inline: bool,
+    /// 本帧主窗口是否窄于内嵌日志阈值
+    win_narrow: bool,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum AppTab {
     Send,
     Settings,
 }
 
-enum AccountEditAction {
-    Save,
-    Cancel,
+/// 账号行的操作结果
+enum AccountRowAction {
+    Edit,
+    Delete,
 }
 
 impl Default for MailApp {
@@ -189,6 +298,13 @@ impl Default for MailApp {
             app_icon: crate::load_app_icon().map(Arc::new),
             edit_account: None,
             edit_account_id: None,
+            pending_delete: None,
+            show_password: false,
+            show_sevenz_password: false,
+            eta: EtaTracker::default(),
+            logo_tex: None,
+            log_inline: false,
+            win_narrow: false,
         }
     }
 }
@@ -196,6 +312,8 @@ impl Default for MailApp {
 impl eframe::App for MailApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let win_w = ui.available_width();
+        self.win_narrow = win_w < LOG_INLINE_MAX_WIDTH;
 
         // 后台线程结束后自动复位 sending，否则 UI 会永远停留在「发送中」
         if self.sending {
@@ -213,30 +331,68 @@ impl eframe::App for MailApp {
             }
         }
 
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("📧 MailSender");
-                ui.separator();
-                ui.selectable_value(&mut self.tab, AppTab::Send, "发送");
-                ui.selectable_value(&mut self.tab, AppTab::Settings, "设置");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.sending {
-                        if let Some(p) = &self.progress {
-                            if p.is_waiting() {
-                                ui.colored_label(
-                                    egui::Color32::DARK_GRAY,
-                                    format!("⏳ 等待定时（{}）", format_left(p.waiting_left())),
-                                );
-                            } else if p.is_stopped() {
-                                ui.colored_label(egui::Color32::RED, "正在停止…");
-                            } else {
-                                ui.label("发送中…");
+        egui::Panel::top("top")
+            .exact_size(TOP_BAR_HEIGHT)
+            .resizable(false)
+            .show(ui, |ui| {
+                let p = theme::palette(ui);
+                let full_width = ui.available_width();
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(2.0);
+                    self.brand_logo(ui);
+                    ui.add_space(9.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(egui::RichText::new("MailSender").size(14.0).color(p.text));
+                        // 窄窗口收起副标题，避免和分段控件、状态文案互相挤压
+                        if full_width >= 620.0 {
+                            ui.label(
+                                egui::RichText::new("邮件发送 · SMTP 轮换")
+                                    .size(10.5)
+                                    .color(p.text_secondary),
+                            );
+                        }
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(2.0);
+                        let status_width = (full_width - 430.0).clamp(0.0, 200.0);
+                        if self.sending {
+                            if let Some(progress) = &self.progress {
+                                if status_width >= 64.0 {
+                                    let (text, color) = if progress.is_waiting() {
+                                        (
+                                            format!(
+                                                "等待定时（{}）",
+                                                format_left(progress.waiting_left())
+                                            ),
+                                            p.text_secondary,
+                                        )
+                                    } else if progress.is_stopped() {
+                                        ("正在停止…".to_string(), p.danger)
+                                    } else {
+                                        ("发送中…".to_string(), p.ok)
+                                    };
+                                    ui.add_sized(
+                                        [status_width, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(text).size(12.0).color(color),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
                             }
                         }
-                    }
+                        ui.add_space(10.0);
+                        // 540px 下把分段控件收窄，保证品牌区不被挤压换行
+                        let switch_w = if full_width < 600.0 { 124.0 } else { TAB_SWITCH_WIDTH };
+                        if tab_switch(ui, &mut self.tab, p, switch_w) {
+                            // 切页时退出内嵌日志视图
+                            self.log_inline = false;
+                        }
+                    });
                 });
             });
-        });
 
         // 主窗口底部固定一行状态条（替代原来的可拖拽日志面板）：
         // 只占 28px，不再挤压中央区；完整日志在独立日志窗口里看。
@@ -245,16 +401,77 @@ impl eframe::App for MailApp {
             .resizable(false)
             .show(ui, |ui| self.ui_status_bar(ui));
 
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            AppTab::Send => self.ui_send(ui),
-            AppTab::Settings => self.ui_settings(ui),
-        });
+        // 发送页主操作固定在底部，不随滚动区滚走（发送中由进度区接管）
+        if self.tab == AppTab::Send && !self.sending && !self.log_inline {
+            let p = theme::palette(ui);
+            egui::Panel::bottom("send_actions")
+                .exact_size(62.0)
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(p.surface)
+                        .inner_margin(egui::Margin {
+                            left: 16,
+                            right: 16,
+                            top: 8,
+                            bottom: 8,
+                        }),
+                )
+                .show(ui, |ui| self.ui_send_actions(ui));
+        }
+
+        // 设置页：保存动作统一放在底栏，不随滚动区滚走
+        if self.tab == AppTab::Settings && !self.log_inline {
+            let p = theme::palette(ui);
+            egui::Panel::bottom("settings_actions")
+                .exact_size(62.0)
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(p.surface)
+                        .inner_margin(egui::Margin {
+                            left: 16,
+                            right: 16,
+                            top: 8,
+                            bottom: 8,
+                        }),
+                )
+                .show(ui, |ui| self.ui_settings_actions(ui));
+        }
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin {
+                    left: 14,
+                    right: 14,
+                    top: 14,
+                    bottom: 14,
+                }),
+            )
+            .show(ui, |ui| {
+                if self.log_inline {
+                    self.ui_log_inline(ui);
+                } else {
+                    match self.tab {
+                        AppTab::Send => self.ui_send(ui),
+                        AppTab::Settings => self.ui_settings(ui),
+                    }
+                }
+            });
+
+        // 删除账号确认弹窗（挡住其余输入，确认后才真正删除）
+        self.show_delete_modal(&ctx);
 
         // 日志窗口：先处理本帧的「打开/前置」请求，再在需要时重新声明该视口。
         // 必须在 UI 之后做，这样本帧按钮点击产生的请求也能立刻生效。
         if self.pending_open_log {
             self.pending_open_log = false;
-            self.request_log_window(&ctx);
+            if self.win_narrow {
+                // 窄窗口（含默认 660px）不再弹第二个 OS 窗口，改为原位切换
+                self.log_inline = true;
+            } else {
+                self.request_log_window(&ctx);
+            }
         }
         if self.log_open.load(Ordering::Relaxed) {
             self.show_log_window(&ctx);
@@ -268,6 +485,12 @@ impl eframe::App for MailApp {
             let seen = self.log_ui.lock().seen;
             if self.logger.len() > seen {
                 ctx.request_repaint_of(log_viewport_id());
+            }
+        } else if self.log_inline {
+            // 内嵌日志在发送中持续刷新
+            let seen = self.log_ui.lock().seen;
+            if self.logger.len() > seen {
+                ctx.request_repaint();
             }
         }
 
@@ -285,64 +508,98 @@ impl MailApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             // ---------- ① 附件 ----------
             section(ui, "① 选择附件", |ui| {
+                // 任意时刻拖入文件都能追加（空态有拖放提示区，非空态同样生效）
+                let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+                    i.raw
+                        .dropped_files
+                        .iter()
+                        .map(|f| f.path().to_path_buf())
+                        // 只接受真实存在的文件（忽略拖入的文本/内存对象）
+                        .filter(|p| p.is_file())
+                        .collect()
+                });
+                if !dropped.is_empty() {
+                    let n = dropped.len();
+                    self.files.extend(dropped);
+                    self.refresh_autofill();
+                    self.logger.info(format!("已通过拖放添加 {} 个文件", n));
+                }
+
+                let p = theme::palette(ui);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add(egui::Button::new("📂 添加文件").min_size(egui::vec2(110.0, 28.0)))
-                        .clicked()
-                    {
+                    if button(ui, BtnKind::Secondary, Some(Icon::Plus), "添加文件").clicked() {
                         if let Some(mut files) = rfd::FileDialog::new().pick_files() {
                             self.files.append(&mut files);
                             self.refresh_autofill();
                         }
                     }
-                    if !self.files.is_empty() && ui.button("清空").clicked() {
-                        self.files.clear();
-                        self.refresh_autofill();
-                    }
-                    if !self.files.is_empty()
-                        && ui
-                            .button("✨ 根据附件重新生成主题/正文")
+                    if !self.files.is_empty() {
+                        if button(ui, BtnKind::Ghost, Some(Icon::Trash), "清空").clicked() {
+                            self.files.clear();
+                            self.refresh_autofill();
+                        }
+                        if button(ui, BtnKind::Ghost, Some(Icon::Refresh), "重新生成主题/正文")
                             .on_hover_text("覆盖当前主题与正文（包括手动修改过的内容）")
                             .clicked()
-                    {
-                        self.subject_dirty = false;
-                        self.body_dirty = false;
-                        self.refresh_autofill();
-                        self.logger.info("已根据附件重新生成主题与正文");
+                        {
+                            self.subject_dirty = false;
+                            self.body_dirty = false;
+                            self.refresh_autofill();
+                            self.logger.info("已根据附件重新生成主题与正文");
+                        }
                     }
                 });
 
+                ui.add_space(theme::SPACE_SM);
+
                 if self.files.is_empty() {
-                    ui.weak("尚未选择文件");
+                    if drop_zone(ui) {
+                        if let Some(mut files) = rfd::FileDialog::new().pick_files() {
+                            self.files.append(&mut files);
+                            self.refresh_autofill();
+                        }
+                    }
                 } else {
                     let mut remove: Option<usize> = None;
-                    for (i, f) in self.files.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("✕").clicked() {
-                                remove = Some(i);
+                    egui::ScrollArea::vertical()
+                        .id_salt("attachment_list")
+                        .max_height(190.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (i, f) in self.files.iter().enumerate() {
+                                if attachment_row(ui, f) {
+                                    remove = Some(i);
+                                }
                             }
-                            ui.label(f.display().to_string());
                         });
-                    }
                     if let Some(i) = remove {
                         self.files.remove(i);
                         self.refresh_autofill();
                     }
 
+                    ui.add_space(theme::SPACE_SM);
                     if let Some(sum) = autofill::summarize_attachments(&self.files) {
-                        ui.weak(format!(
-                            "共 {} 个文件，总大小 {}",
-                            sum.count,
-                            autofill::format_size(sum.total_bytes)
-                        ));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "共 {} 个 / 总大小 {}",
+                                sum.count,
+                                autofill::format_size(sum.total_bytes)
+                            ))
+                            .size(11.5)
+                            .color(p.text_secondary),
+                        );
                     }
                 }
             });
 
             // ---------- ② 收件人与内容 ----------
             section(ui, "② 收件人与内容", |ui| {
-                egui::Grid::new("send_fields").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("收件人");
+                egui::Grid::new("send_fields")
+                    .num_columns(2)
+                    .min_col_width(56.0)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                    field_label(ui, "收件人");
                     ui.horizontal(|ui| {
                         // 输入框宽度自适应：给右侧「历史」下拉预留约 130px
                         let input_width = (ui.available_width() - 130.0).clamp(140.0, 420.0);
@@ -356,7 +613,7 @@ impl MailApp {
                             .selected_text("历史")
                             .show_ui(ui, |ui| {
                                 for email in &self.config.history.recipients {
-                                    if ui.selectable_label(false, email).clicked() {
+                                    if chip_button(ui, email, false).clicked() {
                                         self.to = email.clone();
                                     }
                                 }
@@ -364,7 +621,7 @@ impl MailApp {
                     });
                     ui.end_row();
 
-                    ui.label("主题");
+                    field_label(ui, "主题");
                     if ui
                         .add(
                             egui::TextEdit::singleline(&mut self.subject)
@@ -376,7 +633,7 @@ impl MailApp {
                     }
                     ui.end_row();
 
-                    ui.label("正文");
+                    field_label(ui, "正文");
                     if ui
                         .add(
                             egui::TextEdit::multiline(&mut self.body)
@@ -401,7 +658,8 @@ impl MailApp {
                         .interval_max_sec
                         .unwrap_or(min.max(self.config.interval_sec));
                     let r1 = ui
-                        .add(
+                        .add_sized(
+                            [96.0, 28.0],
                             egui::DragValue::new(&mut min)
                                 .range(0..=86_400u64)
                                 .prefix("最小 ")
@@ -409,7 +667,8 @@ impl MailApp {
                         )
                         .changed();
                     let r2 = ui
-                        .add(
+                        .add_sized(
+                            [96.0, 28.0],
                             egui::DragValue::new(&mut max)
                                 .range(0..=86_400u64)
                                 .prefix("最大 ")
@@ -432,118 +691,148 @@ impl MailApp {
                     .zip(self.config.interval_max_sec)
                     .is_some_and(|(min, max)| min > max)
                 {
-                    ui.colored_label(egui::Color32::RED, "最小值大于最大值，发送时会自动交换");
+                    ui.colored_label(
+                        theme::palette(ui).danger,
+                        "最小值大于最大值，发送时会自动交换",
+                    );
                 }
 
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(6.0);
 
-                // ===== 定时开始（仅本次发送）=====
-                let sched_resp =
-                    ui.checkbox(&mut self.sched_enabled, "⏰ 定时开始（仅本次发送有效）");
+                // ===== 定时开始（仅本次发送）：开关 + 摘要 chip 一行，展开后一行控件 =====
+                let p = theme::palette(ui);
+                let mut toggled = false;
+                ui.horizontal(|ui| {
+                    toggled = toggle_switch(ui, &mut self.sched_enabled).changed();
+                    ui.label(egui::RichText::new("定时开始").size(12.5).color(p.text));
+
+                    let (text, fg, bg) = if !self.sched_enabled {
+                        ("未启用".to_string(), p.text_secondary, p.surface_alt)
+                    } else {
+                        match self.schedule_target() {
+                            Ok(t) => {
+                                let now = chrono::Local::now().naive_local();
+                                if t > now {
+                                    let left = (t - now).num_seconds() as u64;
+                                    (
+                                        format!(
+                                            "{} · 剩余 {}",
+                                            t.format("%m-%d %H:%M"),
+                                            format_left(left)
+                                        ),
+                                        p.accent,
+                                        p.accent_soft,
+                                    )
+                                } else {
+                                    (
+                                        format!("{} · 时间已过，将立即发送", t.format("%m-%d %H:%M")),
+                                        p.warn,
+                                        tint(p.warn, 30),
+                                    )
+                                }
+                            }
+                            Err(_) => ("时间无效".to_string(), p.danger, tint(p.danger, 30)),
+                        }
+                    };
+                    chip(ui, &text, fg, bg);
+                });
+
                 // 勾选时：用户还没手动选过时间，就重置为「当前本地时间 + 30 分钟」
-                if sched_resp.changed() && self.sched_enabled && !self.sched_user_set {
+                if toggled && self.sched_enabled && !self.sched_user_set {
                     self.reset_schedule_default();
                 }
 
-                ui.add_enabled_ui(self.sched_enabled, |ui| {
-                    let mut edited = false;
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("开始时间");
-                        edited |= ui
-                            .add(
-                                egui::DragValue::new(&mut self.sched_date.0)
-                                    .range(2024..=2100)
-                                    .suffix(" 年"),
-                            )
-                            .changed();
-                        edited |= ui
-                            .add(egui::DragValue::new(&mut self.sched_date.1).range(1..=12).suffix(" 月"))
-                            .changed();
-                        edited |= ui
-                            .add(egui::DragValue::new(&mut self.sched_date.2).range(1..=31).suffix(" 日"))
-                            .changed();
-                        edited |= ui
-                            .add(egui::DragValue::new(&mut self.sched_time.0).range(0..=23).suffix(" 时"))
-                            .changed();
-                        edited |= ui
-                            .add(egui::DragValue::new(&mut self.sched_time.1).range(0..=59).suffix(" 分"))
-                            .changed();
-                        edited |= ui
-                            .add(egui::DragValue::new(&mut self.sched_time.2).range(0..=59).suffix(" 秒"))
-                            .changed();
-                    });
-                    if edited {
-                        // 手动改过任何一个字段后，后续勾选/取消不再覆盖用户选择
-                        self.sched_user_set = true;
-                    }
-                    // 顺序：−1h −10m −5m | +1m +10m +1h；窄窗口自动换行避免挤爆
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("−1 小时").clicked() {
-                            self.shift_schedule(Duration::hours(-1));
-                        }
-                        if ui.button("−10 分钟").clicked() {
+                // 展开后只保留：日期 / 时间两个 DragValue + −10m / −5m / +10m 预设
+                let state_id = ui.scope_id().with("schedule_body");
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    state_id,
+                    self.sched_enabled,
+                );
+                state.set_open(self.sched_enabled);
+
+                let mut edited = false;
+                state.show_body_unindented(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("开始").size(12.0).color(p.text_secondary));
+                        edited |= date_drag(ui, &mut self.sched_date);
+                        edited |= time_drag(ui, &mut self.sched_time);
+                        ui.add_space(theme::SPACE_XS);
+                        if button(ui, BtnKind::Ghost, None, "-10 分钟").clicked() {
                             self.shift_schedule(Duration::minutes(-10));
                         }
-                        if ui.button("−5 分钟").clicked() {
+                        if button(ui, BtnKind::Ghost, None, "-5 分钟").clicked() {
                             self.shift_schedule(Duration::minutes(-5));
                         }
-                        ui.separator();
-                        if ui.button("+1 分钟").clicked() {
-                            self.shift_schedule(Duration::minutes(1));
-                        }
-                        if ui.button("+10 分钟").clicked() {
+                        if button(ui, BtnKind::Ghost, None, "+10 分钟").clicked() {
                             self.shift_schedule(Duration::minutes(10));
                         }
-                        if ui.button("+1 小时").clicked() {
-                            self.shift_schedule(Duration::hours(1));
-                        }
                     });
-
-                    match self.schedule_target() {
-                        Ok(t) => {
-                            let now = chrono::Local::now().naive_local();
-                            let left = (t - now).num_seconds();
-                            if t > now {
-                                ui.label(format!(
-                                    "将于 {} 开始（剩余 {}）",
-                                    t.format("%Y-%m-%d %H:%M:%S"),
-                                    format_left(left as u64)
-                                ));
-                            } else {
-                                ui.colored_label(
-                                    egui::Color32::DARK_BLUE,
-                                    format!(
-                                        "选定时间 {} 已过，点击开始后会立即发送",
-                                        t.format("%Y-%m-%d %H:%M:%S")
-                                    ),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            ui.colored_label(egui::Color32::RED, format!("开始时间无效: {e}"));
-                        }
-                    }
                 });
+                if edited {
+                    // 手动改过日期/时间后，后续勾选/取消不再覆盖用户选择
+                    self.sched_user_set = true;
+                }
             });
 
-            // ---------- ④ 开始发送 / 进度 ----------
-            ui.add_space(6.0);
-            if !self.sending {
-                let ready = !self.files.is_empty()
-                    && !self.to.trim().is_empty()
-                    && !self.config.accounts.is_empty();
-                let btn = egui::Button::new("🚀 开始发送").min_size(egui::vec2(160.0, 34.0));
-                if ui.add_enabled(ready, btn).clicked() {
+            // ---------- ④ 进度（空闲时主操作在底部固定栏）----------
+            if self.sending {
+                if let Some(progress) = &self.progress {
+                    ui.add_space(6.0);
+                    let progress = progress.clone();
+                    self.ui_progress(ui, progress);
+                }
+            }
+        });
+    }
+
+    /// 发送页底部固定操作栏：左侧就绪摘要，右侧主操作
+    fn ui_send_actions(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        let ready = !self.files.is_empty()
+            && !self.to.trim().is_empty()
+            && !self.config.accounts.is_empty();
+        let right_width = 150.0;
+        let left_width = (ui.available_width() - right_width).max(80.0);
+
+        ui.horizontal_centered(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_width, ui.available_height()),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let (summary, dot) = if ready {
+                        (
+                            format!(
+                                "已就绪 · {} 个附件 · {} 个账号",
+                                self.files.len(),
+                                self.config.accounts.len()
+                            ),
+                            p.ok,
+                        )
+                    } else {
+                        (
+                            "需要先选择附件、填写收件人，并在「设置」页配置 SMTP 账号".to_string(),
+                            p.text_secondary,
+                        )
+                    };
+                    ui.label(egui::RichText::new("●").color(dot));
+                    ui.add_space(theme::SPACE_XS);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(summary).size(12.0).color(p.text_secondary),
+                        )
+                        .truncate(),
+                    );
+                },
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if button_cta(ui, ready, "开始发送").clicked() {
                     self.start_send();
                 }
-                if !ready {
-                    ui.weak("需要先选择附件、填写收件人，并在「设置」页配置 SMTP 账号");
-                }
-            } else if let Some(p) = &self.progress {
-                self.ui_progress(ui, p.clone());
-            }
+            });
         });
     }
 
@@ -606,67 +895,143 @@ impl MailApp {
         Ok(NaiveDateTime::new(date, time))
     }
 
+    /// 三阶段进度：单主进度条 + 阶段文案（压缩中 / 发送中 / 等待中 / 已暂停）+ 卷数 + ETA
     fn ui_progress(&mut self, ui: &mut egui::Ui, progress: Arc<SendProgress>) {
-        // 定时等待阶段：进度条还没意义，展示倒计时
-        if progress.is_waiting() {
-            ui.colored_label(
-                egui::Color32::DARK_GRAY,
-                format!("⏳ 等待定时开始，剩余 {}", format_left(progress.waiting_left())),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("⛔ 取消等待").clicked() {
-                    progress.stopped.store(true, Ordering::Relaxed);
-                }
-            });
-            return;
-        }
+        let p = theme::palette(ui);
+
+        let waiting = progress.is_waiting();
+        let paused = progress.is_paused();
+        let stopped = progress.is_stopped();
 
         let cur_file = progress.current_file_index.load(Ordering::Relaxed);
-        let total_files = progress.total_files;
+        let total_files = progress.total_files.max(1);
+        let total_parts = progress.current_file_total_parts.load(Ordering::Relaxed);
+        let sent_parts = progress.current_file_sent_parts.load(Ordering::Relaxed);
 
-        let file_ratio = cur_file as f32 / total_files.max(1) as f32;
+        // 压缩阶段：文件已开始、但分卷总数尚未确定（split_if_needed 还在跑）
+        let compressing = !waiting && !paused && !stopped && cur_file > 0 && total_parts == 0;
 
-        let part_ratio = progress.current_file_sent_parts.load(Ordering::Relaxed) as f32
-            / progress
-                .current_file_total_parts
-                .load(Ordering::Relaxed)
-                .max(1) as f32;
+        let (stage, stage_color) = if stopped {
+            ("正在停止…", p.danger)
+        } else if paused {
+            ("已暂停", p.warn)
+        } else if waiting {
+            ("等待中", p.text_secondary)
+        } else if compressing {
+            ("压缩中", p.text_secondary)
+        } else {
+            ("发送中", p.ok)
+        };
 
-        ui.label(format!("文件进度: {}/{}", cur_file, total_files));
-        ui.add(egui::ProgressBar::new(file_ratio).show_percentage());
-
-        ui.label("当前文件分卷进度");
-        ui.add(egui::ProgressBar::new(part_ratio).show_percentage());
-
-        if progress.is_stopped() {
-            ui.colored_label(egui::Color32::RED, "正在停止…");
-        }
+        let eta = if waiting || stopped { None } else { self.eta.update(&progress) };
 
         ui.horizontal(|ui| {
-            if ui.button("⏸ 暂停").clicked() {
-                progress.paused.store(true, Ordering::Relaxed);
+            if compressing || stopped || waiting {
+                ui.add(egui::Spinner::new().size(14.0).color(stage_color));
+            } else {
+                let dot = egui::RichText::new("●").size(10.0).color(stage_color);
+                ui.label(dot);
             }
-            if ui.button("▶ 继续").clicked() {
-                progress.paused.store(false, Ordering::Relaxed);
-            }
-            if ui.button("⛔ 停止").clicked() {
-                // 只置停止标记，等后台线程真正结束后由 ui() 复位 sending
-                progress.stopped.store(true, Ordering::Relaxed);
+            ui.label(egui::RichText::new(stage).size(12.5).color(stage_color));
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(eta) = eta {
+                    ui.label(
+                        egui::RichText::new(format!("预计剩余 {}", format_left(eta)))
+                            .size(11.0)
+                            .color(p.text_secondary),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!("卷 {}/{}", sent_parts, total_parts.max(1)))
+                        .size(11.0)
+                        .color(p.text_secondary),
+                );
+                ui.label(
+                    egui::RichText::new(format!("文件 {}/{}", cur_file.min(total_files), total_files))
+                        .size(11.0)
+                        .color(p.text_secondary),
+                );
+            });
+        });
+
+        // 单主进度条：压缩阶段用 Spinner（不显示 0%），其余阶段平滑过渡
+        let part_ratio = if total_parts == 0 {
+            0.0
+        } else {
+            sent_parts as f32 / total_parts as f32
+        };
+        let raw = ((cur_file.saturating_sub(1)) as f32 + part_ratio) / total_files as f32;
+
+        if !compressing {
+            let shown = ui
+                .ctx()
+                .animate_value_with_time(egui::Id::unique("send_main_progress"), raw, 0.25);
+            let percent = if waiting {
+                String::new()
+            } else {
+                format!("{:.0}%", shown * 100.0)
+            };
+            ui.add(
+                egui::ProgressBar::new(shown)
+                    .desired_height(12.0)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .fill(if stopped { p.danger } else { p.accent })
+                    .text(egui::RichText::new(percent).size(11.0).color(p.text)),
+            );
+        } else {
+            // 压缩中：不显示会误导的 0%，只留一条轨道
+            ui.add(
+                egui::ProgressBar::new(0.0)
+                    .desired_height(12.0)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .fill(p.accent),
+            );
+        }
+
+        ui.add_space(theme::SPACE_XS);
+        ui.horizontal(|ui| {
+            if waiting {
+                if button(ui, BtnKind::Ghost, Some(Icon::Stop), "取消等待").clicked() {
+                    progress.stopped.store(true, Ordering::Relaxed);
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "定时开始后自动发送，剩余 {}",
+                        format_left(progress.waiting_left())
+                    ))
+                    .size(11.0)
+                    .color(p.text_secondary),
+                );
+            } else {
+                if paused {
+                    if button(ui, BtnKind::Secondary, Some(Icon::Play), "继续").clicked() {
+                        progress.paused.store(false, Ordering::Relaxed);
+                    }
+                } else if button(ui, BtnKind::Secondary, Some(Icon::Pause), "暂停").clicked() {
+                    progress.paused.store(true, Ordering::Relaxed);
+                }
+                if button(ui, BtnKind::Ghost, Some(Icon::Stop), "停止").clicked() {
+                    // 只置停止标记，等后台线程真正结束后由 ui() 复位 sending
+                    progress.stopped.store(true, Ordering::Relaxed);
+                }
             }
         });
     }
 
     fn start_send(&mut self) {
         if self.files.is_empty() {
-            self.logger.error("未选择文件，无法发送");
+            self.logger
+                .error("未选择文件，无法发送（请先在「选择附件」中添加文件）");
             return;
         }
         if self.config.accounts.is_empty() {
-            self.logger.error("没有可用的 SMTP 账号，无法发送");
+            self.logger
+                .error("没有可用的 SMTP 账号，无法发送（请到「设置」页添加账号）");
             return;
         }
         if self.to.trim().is_empty() {
-            self.logger.error("收件人为空，无法发送");
+            self.logger.error("收件人为空，无法发送（请填写收件人）");
             return;
         }
 
@@ -712,9 +1077,14 @@ impl MailApp {
 
         self.progress = Some(progress.clone());
         self.sending = true;
+        self.eta.reset();
         self.schedule_used_this_run = schedule_at.is_some();
-        // 开始发送时自动打开日志窗口（已打开则只做前置，不会多开窗口）
-        self.pending_open_log = true;
+        // 开始发送时自动打开日志：窄窗口原位显示，宽窗口复用独立日志窗口
+        if self.win_narrow {
+            self.log_inline = true;
+        } else {
+            self.pending_open_log = true;
+        }
         self.config.history.record(&to);
         thread::spawn(move || {
             start_send_task(&files, &to, &subject, &body, &config, schedule_at, progress, logger);
@@ -725,35 +1095,35 @@ impl MailApp {
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            section(ui, "SMTP 账号", |ui| {
-                let mut remove_index: Option<usize> = None;
-                let mut start_edit: Option<(Option<usize>, SmtpAccount)> = None;
+            // ===== 账号列表（每行一张卡片）=====
+            let mut start_edit: Option<(Option<usize>, SmtpAccount)> = None;
+            let mut ask_delete: Option<usize> = None;
 
+            section(ui, "SMTP 账号", |ui| {
+                let p = theme::palette(ui);
                 if self.config.accounts.is_empty() {
-                    ui.weak("尚未配置账号，请先添加");
+                    ui.label(
+                        egui::RichText::new(
+                            "尚未配置账号 —— 请点击下方「添加账号」填写 SMTP 信息后再发送",
+                        )
+                        .size(12.0)
+                        .color(p.text_secondary),
+                    );
+                    ui.add_space(theme::SPACE_SM);
                 }
+
                 for (i, acc) in self.config.accounts.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}（{}:{}）", acc.name, acc.smtp, acc.port));
-                        if ui.button("编辑").clicked() {
+                    match account_row(ui, acc) {
+                        Some(AccountRowAction::Edit) => {
                             start_edit = Some((Some(i), acc.clone()));
                         }
-                        if ui.button("删除").clicked() {
-                            remove_index = Some(i);
-                        }
-                    });
-                }
-
-                if let Some(i) = remove_index {
-                    let removed_acc = self.config.accounts.remove(i);
-                    if Some(removed_acc.id) == self.edit_account_id {
-                        self.edit_account_id = None;
-                        self.edit_account = None;
+                        Some(AccountRowAction::Delete) => ask_delete = Some(i),
+                        None => {}
                     }
-                    self.save_config();
+                    ui.add_space(theme::SPACE_XS);
                 }
 
-                if ui.button("➕ 添加账号").clicked() {
+                if button(ui, BtnKind::Secondary, Some(Icon::Plus), "添加账号").clicked() {
                     start_edit = Some((
                         None,
                         SmtpAccount {
@@ -767,114 +1137,302 @@ impl MailApp {
                         },
                     ));
                 }
-
-                // ===== 进入编辑态（UI 后处理）=====
-                if let Some((idx, acc)) = start_edit {
-                    // 必须记录被编辑账号的 ID，否则保存时会被当成「新增」而重复插入账号
-                    self.edit_account_id = if idx.is_some() { Some(acc.id) } else { None };
-                    self.edit_account = Some(acc);
-                }
             });
 
-            // ===== 编辑面板 =====
-            let mut action: Option<AccountEditAction> = None;
+            if let Some(i) = ask_delete {
+                self.pending_delete = Some(i);
+            }
+            // ===== 进入编辑态（UI 后处理）=====
+            if let Some((idx, acc)) = start_edit {
+                // 必须记录被编辑账号的 ID，否则保存时会被当成「新增」而重复插入账号
+                self.edit_account_id = if idx.is_some() { Some(acc.id) } else { None };
+                self.edit_account = Some(acc);
+            }
 
-            if let Some(acc) = &mut self.edit_account {
-                section(ui, "账号配置", |ui| {
-                    egui::Grid::new("account_edit").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                        ui.label("账号名称");
-                        ui.text_edit_singleline(&mut acc.name);
-                        ui.end_row();
-                        ui.label("SMTP 地址");
-                        ui.text_edit_singleline(&mut acc.smtp);
-                        ui.end_row();
-                        ui.label("SMTP 端口");
-                        ui.add(egui::DragValue::new(&mut acc.port).range(1..=65535));
-                        ui.end_row();
-                        ui.label("账号");
-                        ui.text_edit_singleline(&mut acc.username);
-                        ui.end_row();
-                        ui.label("密码/授权码");
-                        ui.add(egui::TextEdit::singleline(&mut acc.password).password(true));
-                        ui.end_row();
-                        ui.label("SSL");
-                        ui.checkbox(&mut acc.ssl, "465 端口一般勾选；587 一般不勾");
-                        ui.end_row();
-                    });
+            // ===== 编辑面板（保存/取消统一在设置页底栏）=====
+            if self.edit_account.is_some() {
+                let mut acc = self.edit_account.take().expect("上面已判断存在");
+                let mut show_pw = self.show_password;
+                // 入场淡入（展开/收起统一使用 animate_bool 的时长曲线）
+                let open_t = ui
+                    .ctx()
+                    .animate_bool_with_time(ui.scope_id().with("account_edit_open"), true, 0.2);
 
-                    ui.horizontal(|ui| {
-                        if ui.button("💾 保存账号").clicked() {
-                            action = Some(AccountEditAction::Save);
-                        }
-                        if ui.button("取消").clicked() {
-                            action = Some(AccountEditAction::Cancel);
-                        }
+                ui.scope(|ui| {
+                    ui.set_opacity(open_t);
+                    section(ui, "账号配置", |ui| {
+                        let p = theme::palette(ui);
+                    egui::Grid::new("account_edit")
+                        .num_columns(2)
+                        .min_col_width(72.0)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            field_label(ui, "名称");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut acc.name)
+                                    .hint_text("例如：主账号")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.end_row();
+
+                            // 服务器与端口同一行，端口固定宽度
+                            field_label(ui, "服务器");
+                            ui.horizontal(|ui| {
+                                let port_w = 78.0;
+                                let w = (ui.available_width() - port_w - 8.0).max(120.0);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut acc.smtp)
+                                        .hint_text("smtp.example.com")
+                                        .desired_width(w),
+                                );
+                                ui.add_sized(
+                                    [port_w, 28.0],
+                                    egui::DragValue::new(&mut acc.port).range(1..=65535),
+                                );
+                            });
+                            ui.end_row();
+
+                            field_label(ui, "登录名");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut acc.username)
+                                    .hint_text("通常是邮箱地址")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.end_row();
+
+                            field_label(ui, "密码");
+                            ui.horizontal(|ui| {
+                                let w = (ui.available_width() - 78.0).max(120.0);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut acc.password)
+                                        .hint_text("授权码 / 密码")
+                                        .password(!show_pw)
+                                        .desired_width(w),
+                                );
+                                if button(
+                                    ui,
+                                    BtnKind::Ghost,
+                                    None,
+                                    if show_pw { "隐藏" } else { "显示" },
+                                )
+                                .clicked()
+                                {
+                                    show_pw = !show_pw;
+                                }
+                            });
+                            ui.end_row();
+
+                            field_label(ui, "SSL");
+                            ui.checkbox(&mut acc.ssl, "465 端口一般勾选；587 一般不勾");
+                            ui.end_row();
+                        });
+
+                        ui.add_space(theme::SPACE_XS);
+                        ui.label(
+                            egui::RichText::new("修改完成后，请在页面底栏点击「保存账号」写入配置")
+                                .size(11.0)
+                                .color(p.text_secondary),
+                        );
                     });
                 });
+
+                self.show_password = show_pw;
+                self.edit_account = Some(acc);
             }
 
-            // ===== 编辑结果处理 =====
-            if let Some(action) = action {
-                match action {
-                    AccountEditAction::Save => {
-                        if let Some(acc) = self.edit_account.take() {
-                            match self.edit_account_id {
-                                Some(id) => {
-                                    if let Some(target) =
-                                        self.config.accounts.iter_mut().find(|a| a.id == id)
-                                    {
-                                        *target = acc;
-                                    } else {
-                                        self.config.accounts.push(acc);
-                                    }
-                                }
-                                None => {
-                                    self.config.accounts.push(acc);
-                                }
-                            }
-                            self.save_config();
-                        }
-                        self.edit_account_id = None;
-                    }
-                    AccountEditAction::Cancel => {
-                        self.edit_account = None;
-                        self.edit_account_id = None;
-                    }
-                }
-            }
-
+            // ===== 7z 分卷与加密 =====
             section(ui, "7z 分卷与加密", |ui| {
+                let p = theme::palette(ui);
                 ui.horizontal(|ui| {
-                    ui.label("分卷大小");
-                    ui.add(
+                    field_label(ui, "分卷大小");
+                    ui.add_sized(
+                        [96.0, 28.0],
                         egui::DragValue::new(&mut self.config.split_mb)
                             .range(1..=10_000u64)
                             .suffix(" MB"),
                     );
+                    ui.label(
+                        egui::RichText::new("超出后自动分卷压缩")
+                            .size(11.0)
+                            .color(p.text_secondary),
+                    );
                 });
+
+                ui.add_space(theme::SPACE_SM);
                 ui.horizontal(|ui| {
-                    ui.label("压缩密码");
+                    field_label(ui, "压缩密码");
+                    let show = self.show_sevenz_password;
+                    let w = (ui.available_width() - 78.0).max(140.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.config.sevenz_password)
                             .hint_text("留空则不加密")
-                            .desired_width(200.0),
+                            .password(!show)
+                            .desired_width(w),
                     );
+                    if button(ui, BtnKind::Ghost, None, if show { "隐藏" } else { "显示" }).clicked()
+                    {
+                        self.show_sevenz_password = !self.show_sevenz_password;
+                    }
                 });
+
                 if self.config.sevenz_password.is_empty() {
-                    ui.colored_label(egui::Color32::YELLOW, "密码为空：附件将不加密发送");
+                    ui.add_space(theme::SPACE_XS);
+                    ui.label(
+                        egui::RichText::new(
+                            "密码为空 —— 附件将以不加密方式发送；如需保护内容，请填写压缩密码",
+                        )
+                        .size(11.5)
+                        .color(p.warn),
+                    );
                 }
             });
-
-            if ui
-                .add(egui::Button::new("💾 保存配置").min_size(egui::vec2(120.0, 30.0)))
-                .clicked()
-            {
-                for note in self.config.normalize() {
-                    self.logger.warn(format!("配置已修正: {}", note));
-                }
-                self.save_config();
-            }
         });
+    }
+
+    /// 设置页底栏：编辑中显示「保存账号 / 取消」，否则显示「保存配置」
+    fn ui_settings_actions(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        let editing = self.edit_account.is_some();
+        let right_width = if editing { 236.0 } else { 150.0 };
+        let left_width = (ui.available_width() - right_width).max(80.0);
+
+        ui.horizontal_centered(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_width, ui.available_height()),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(egui::RichText::new("●").color(if editing { p.warn } else { p.ok }));
+                    ui.add_space(theme::SPACE_XS);
+                    let summary = if editing {
+                        "账号信息编辑中 —— 点击「保存账号」写入配置"
+                    } else {
+                        "配置修改后请点击「保存配置」写入配置文件"
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(summary).size(12.0).color(p.text_secondary),
+                        )
+                        .truncate(),
+                    );
+                },
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if editing {
+                    if button(ui, BtnKind::Primary, Some(Icon::Save), "保存账号").clicked() {
+                        self.save_edit_account();
+                    }
+                    if button(ui, BtnKind::Ghost, None, "取消").clicked() {
+                        self.edit_account = None;
+                        self.edit_account_id = None;
+                    }
+                } else if button(ui, BtnKind::Primary, Some(Icon::Save), "保存配置").clicked() {
+                    for note in self.config.normalize() {
+                        self.logger.warn(format!("配置已修正: {}", note));
+                    }
+                    self.save_config();
+                }
+            });
+        });
+    }
+
+    /// 把编辑缓存写入账号列表并落盘
+    fn save_edit_account(&mut self) {
+        if let Some(acc) = self.edit_account.take() {
+            match self.edit_account_id {
+                Some(id) => {
+                    if let Some(target) = self.config.accounts.iter_mut().find(|a| a.id == id) {
+                        *target = acc;
+                    } else {
+                        self.config.accounts.push(acc);
+                    }
+                }
+                None => {
+                    self.config.accounts.push(acc);
+                }
+            }
+            self.save_config();
+        }
+        self.edit_account_id = None;
+    }
+
+    /// 删除账号确认弹窗（Modal 会挡住其余输入）
+    fn show_delete_modal(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.pending_delete else {
+            return;
+        };
+        let Some(acc) = self.config.accounts.get(idx) else {
+            self.pending_delete = None;
+            return;
+        };
+        let label = if acc.name.trim().is_empty() {
+            acc.smtp.clone()
+        } else {
+            format!("{}（{}）", acc.name, acc.smtp)
+        };
+
+        let mut confirm = false;
+        let mut cancel = false;
+        let resp = egui::Modal::new(egui::Id::unique("delete_account_modal")).show(ctx, |ui| {
+            let p = theme::palette(ui);
+            ui.set_max_width(360.0);
+            ui.label(egui::RichText::new("删除账号").size(15.0).color(p.text));
+            ui.add_space(theme::SPACE_SM);
+            ui.label(
+                egui::RichText::new(format!(
+                    "确认删除「{}」？删除后无法恢复，只能重新填写 SMTP 信息。",
+                    label
+                ))
+                .size(12.5)
+                .color(p.text_secondary),
+            );
+            ui.add_space(theme::SPACE_MD);
+            ui.horizontal(|ui| {
+                if button(ui, BtnKind::Ghost, None, "取消").clicked() {
+                    cancel = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button_tinted(
+                        ui,
+                        BtnKind::Primary,
+                        None,
+                        "删除",
+                        Some(p.danger),
+                        Some(egui::Color32::WHITE),
+                    )
+                    .clicked()
+                    {
+                        confirm = true;
+                    }
+                });
+            });
+        });
+
+        if resp.backdrop_response.clicked() {
+            cancel = true;
+        }
+
+        if cancel {
+            self.pending_delete = None;
+        }
+        if confirm {
+            if let Some(i) = self.pending_delete.take() {
+                if i < self.config.accounts.len() {
+                    let removed = self.config.accounts.remove(i);
+                    if Some(removed.id) == self.edit_account_id {
+                        self.edit_account = None;
+                        self.edit_account_id = None;
+                    }
+                    let name = if removed.name.trim().is_empty() {
+                        removed.smtp.clone()
+                    } else {
+                        removed.name.clone()
+                    };
+                    self.save_config();
+                    self.logger.info(format!("已删除账号「{}」", name));
+                }
+            }
+        }
     }
 
     /// 保存配置并把失败原因写进日志（不再静默吞掉写盘错误）
@@ -893,8 +1451,8 @@ impl MailApp {
         let total = entries.len();
         let follow = self.log_ui.lock().follow;
 
-        // 右侧固定块宽度（打开日志 + 共 N 条 + ⤓ + 进度文字）
-        let right_width = if self.sending { 300.0 } else { 200.0 };
+        // 右侧固定块宽度（打开日志 + 共 N 条 + 跟随状态 + 进度文字）
+        let right_width = if self.sending { 300.0 } else { 216.0 };
         let left_width = (ui.available_width() - right_width).max(80.0);
 
         ui.horizontal_centered(|ui| {
@@ -904,35 +1462,64 @@ impl MailApp {
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| match entries.last() {
                     Some(log) => {
-                        ui.label(egui::RichText::new("●").color(level_color(log.level)));
+                        ui.label(egui::RichText::new("●").color(level_color(ui, log.level)));
                         ui.add(
                             egui::Label::new(format!("[{}] {}", log.time, log.message))
                                 .truncate(),
                         );
                     }
                     None => {
-                        ui.weak("暂无日志");
+                        ui.weak("暂无日志 · 开始发送后这里会显示运行记录");
                     }
                 },
             );
 
             // 右侧：进度状态 / 跟随暂停 / 条数 / 打开日志（从右到左排）
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("打开日志")
-                    .on_hover_text("打开独立的日志窗口（已打开则前置）")
+                let p = theme::palette(ui);
+                let log_btn = if self.log_inline {
+                    button(ui, BtnKind::Ghost, Some(Icon::Close), "关闭日志")
+                } else {
+                    button(ui, BtnKind::Ghost, Some(Icon::Log), "打开日志")
+                };
+                if log_btn
+                    .on_hover_text(if self.win_narrow {
+                        "在当前窗口内查看运行日志"
+                    } else {
+                        "打开独立的日志窗口（已打开则前置）"
+                    })
                     .clicked()
                 {
-                    self.pending_open_log = true;
+                    if self.log_inline {
+                        // 正在内嵌显示时，这个按钮就是「关闭日志」
+                        self.log_inline = false;
+                    } else if self.win_narrow {
+                        // 窄窗口原位切换，不再弹第二个 OS 窗口
+                        self.log_inline = true;
+                    } else {
+                        self.pending_open_log = true;
+                    }
                 }
-                ui.label(format!("共 {} 条", total));
+                ui.label(
+                    egui::RichText::new(format!("共 {} 条", total))
+                        .size(11.0)
+                        .color(p.text_secondary),
+                );
                 if !follow {
-                    ui.colored_label(egui::Color32::YELLOW, "⤓")
-                        .on_hover_text("日志窗口已暂停自动跟随（可回到底部恢复）");
+                    ui.label(
+                        egui::RichText::new("已暂停跟随")
+                            .size(11.0)
+                            .color(p.text_secondary),
+                    )
+                    .on_hover_text("日志已暂停自动跟随（滚回底部或点击「回到底部」恢复）");
                 }
                 if self.sending {
-                    if let Some(p) = &self.progress {
-                        ui.label(progress_summary(p));
+                    if let Some(progress) = &self.progress {
+                        ui.label(
+                            egui::RichText::new(progress_summary(progress))
+                                .size(11.0)
+                                .color(p.text_secondary),
+                        );
                     }
                 }
             });
@@ -958,6 +1545,26 @@ impl MailApp {
         }
         self.log_focus_pending = true;
         ctx.request_repaint();
+    }
+
+    /// 内嵌日志页：宽度不足 760px 时替代第二个 OS 窗口
+    fn ui_log_inline(&mut self, ui: &mut egui::Ui) {
+        let entries = self.logger.entries();
+        let total = entries.len();
+        let (close, follow) = {
+            let mut st = self.log_ui.lock();
+            let close = log_header(ui, &mut st, total, true);
+            ui.separator();
+            draw_log_scroll(ui, &entries, &mut st);
+            (close, st.follow)
+        };
+        if close {
+            self.log_inline = false;
+            ui.ctx().request_repaint();
+        }
+        if !follow {
+            ui.ctx().request_repaint();
+        }
     }
 
     /// 每帧声明日志视口（固定 ViewportId → 永远复用同一个 OS 窗口，不会重复开窗）
@@ -992,10 +1599,10 @@ impl MailApp {
                 let mut st = shared.lock();
                 let follow_before = st.follow;
 
-                log_header(ui, &mut st, entries.len());
+                log_header(ui, &mut st, entries.len(), false);
                 draw_log_scroll(ui, &entries, &mut st);
 
-                // 跟随状态变化时唤醒主窗口，让状态条的 ⤓ 提示同步
+                // 跟随状态变化时唤醒主窗口，让状态条的「已暂停跟随」提示同步
                 if st.follow != follow_before {
                     ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
                 }
@@ -1009,25 +1616,101 @@ impl MailApp {
     }
 }
 
-/// 日志窗口标题行（共 N 条 + 暂停跟随时的「回到底部」）
-fn log_header(ui: &mut egui::Ui, st: &mut LogUiState, total: usize) {
+impl MailApp {
+    /// 顶栏品牌 logo：优先用 assets 里的图标（懒加载纹理），失败时退回信封线稿
+    fn brand_logo(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        const LOGO_PNG: &[u8] = include_bytes!("../assets/icon_128.png");
+
+        if self.logo_tex.is_none() {
+            if let Ok(icon) = eframe::icon_data::from_png_bytes(LOGO_PNG) {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
+                );
+                self.logo_tex = Some(ui.ctx().load_texture(
+                    "mailsender_logo",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+        let painter = ui.painter();
+        let radius = egui::CornerRadius::same(theme::CONTROL_RADIUS);
+        painter.rect_filled(rect, radius, p.surface_alt);
+
+        match &self.logo_tex {
+            Some(tex) => {
+                painter.image(
+                    tex.id(),
+                    rect.shrink(1.0),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            None => {
+                let inset = rect.shrink(7.0);
+                let stroke = egui::Stroke::new(1.2, p.text_secondary);
+                painter.rect_stroke(
+                    inset,
+                    egui::CornerRadius::same(2),
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+                let mid = egui::pos2(inset.center().x, inset.top() + inset.height() * 0.42);
+                painter.line_segment([inset.left_top(), mid], stroke);
+                painter.line_segment([inset.right_top(), mid], stroke);
+            }
+        }
+
+        painter.rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, p.border),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// 日志窗口标题行（等级筛选 + 跟随状态 + 回到顶部按钮），返回「是否请求关闭内嵌视图」
+fn log_header(ui: &mut egui::Ui, st: &mut LogUiState, total: usize, inline: bool) -> bool {
+    let p = theme::palette(ui);
+    let mut close = false;
     ui.horizontal(|ui| {
-        ui.strong("运行日志");
-        ui.weak(format!("共 {} 条", total));
+        ui.label(egui::RichText::new("运行日志").size(13.5).color(p.text));
+        ui.label(
+            egui::RichText::new(format!("共 {} 条", total))
+                .size(11.0)
+                .color(p.text_secondary),
+        );
+        ui.add_space(theme::SPACE_MD);
+
+        // 等级筛选（顶部一行，三个 chip）
+        for f in [LogFilter::All, LogFilter::Warn, LogFilter::Error] {
+            if chip_button(ui, f.label(), st.filter == f).clicked() {
+                st.filter = f;
+            }
+        }
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if !st.follow {
-                ui.colored_label(egui::Color32::YELLOW, "已暂停自动跟随");
-                if ui
-                    .button("⤓ 回到底部")
-                    .on_hover_text("恢复自动滚动到最新日志")
-                    .clicked()
-                {
-                    st.follow = true;
-                    st.jump = true;
-                }
+            if inline && button(ui, BtnKind::Ghost, Some(Icon::Close), "返回").clicked() {
+                close = true;
+            }
+            if st.follow {
+                ui.label(
+                    egui::RichText::new("自动跟随中")
+                        .size(11.0)
+                        .color(p.text_secondary),
+                );
+            } else if button(ui, BtnKind::Ghost, Some(Icon::ArrowDown), "回到底部").clicked() {
+                st.follow = true;
+                st.jump = true;
             }
         });
     });
+    close
 }
 
 /// 日志滚动区（含「不操作时自动跟随」逻辑），日志窗口与状态条共用同一份 `LogUiState`
@@ -1049,8 +1732,30 @@ fn draw_log_scroll(ui: &mut egui::Ui, entries: &[LogItem], st: &mut LogUiState) 
         .id_salt("log_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let mut shown = 0usize;
             for log in entries {
-                ui.colored_label(level_color(log.level), format!("[{}] {}", log.time, log.message));
+                if !st.filter.accepts(log.level) {
+                    continue;
+                }
+                shown += 1;
+                log_row(ui, log);
+            }
+            if shown == 0 {
+                let p = theme::palette(ui);
+                ui.add_space(theme::SPACE_SM);
+                let hint = if st.filter == LogFilter::All {
+                    "暂无日志 —— 开始发送后，这里会按时间、等级显示运行记录".to_string()
+                } else {
+                    format!(
+                        "当前筛选（{}）下暂无日志 —— 可切换到「全部」查看完整记录",
+                        st.filter.label()
+                    )
+                };
+                ui.label(
+                    egui::RichText::new(hint)
+                        .size(11.5)
+                        .color(p.text_secondary),
+                );
             }
             if stick {
                 ui.scroll_to_cursor_animation(
@@ -1088,19 +1793,64 @@ fn draw_log_scroll(ui: &mut egui::Ui, entries: &[LogItem], st: &mut LogUiState) 
     st.view_rect = Some(out.inner_rect);
 }
 
-/// 日志级别对应的颜色（状态条圆点、日志行共用）
-fn level_color(level: LogLevel) -> egui::Color32 {
+/// 结构化日志行：等宽字体 + 固定时间列 + 固定等级列 + 单行省略（hover 看全文）
+fn log_row(ui: &mut egui::Ui, log: &LogItem) {
+    let p = theme::palette(ui);
+    let (level_text, level_color, msg_color) = match log.level {
+        LogLevel::Info => ("INFO", p.text_secondary, p.text),
+        LogLevel::Warn => ("WARN", p.warn, p.warn),
+        LogLevel::Error => ("ERROR", p.danger, p.danger),
+    };
+
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [58.0, 18.0],
+            egui::Label::new(
+                egui::RichText::new(&log.time)
+                    .monospace()
+                    .size(11.5)
+                    .color(p.text_secondary),
+            ),
+        );
+        ui.add_sized(
+            [44.0, 18.0],
+            egui::Label::new(
+                egui::RichText::new(level_text)
+                    .monospace()
+                    .size(11.0)
+                    .color(level_color),
+            ),
+        );
+        let width = ui.available_width().max(48.0);
+        let resp = ui.add_sized(
+            [width, 18.0],
+            egui::Label::new(
+                egui::RichText::new(&log.message)
+                    .monospace()
+                    .size(11.5)
+                    .color(msg_color),
+            )
+            .truncate(),
+        );
+        // 长消息单行省略，悬停显示全文
+        resp.on_hover_text(&log.message);
+    });
+}
+
+/// 日志级别对应的颜色（状态条圆点、日志行共用），取自当前主题的语义色
+fn level_color(ui: &egui::Ui, level: LogLevel) -> egui::Color32 {
+    let p = theme::palette(ui);
     match level {
-        LogLevel::Info => egui::Color32::LIGHT_GREEN,
-        LogLevel::Warn => egui::Color32::YELLOW,
-        LogLevel::Error => egui::Color32::RED,
+        LogLevel::Info => p.text_secondary,
+        LogLevel::Warn => p.warn,
+        LogLevel::Error => p.danger,
     }
 }
 
 /// 状态条右侧的发送状态摘要（等待倒计时 / 分卷进度 / 正在停止）
 fn progress_summary(p: &SendProgress) -> String {
     if p.is_waiting() {
-        format!("⏳ 剩余 {}", format_left(p.waiting_left()))
+        format!("等待 · 剩余 {}", format_left(p.waiting_left()))
     } else if p.is_stopped() {
         "正在停止…".to_string()
     } else {
@@ -1116,12 +1866,867 @@ fn progress_summary(p: &SendProgress) -> String {
 
 /// 分区卡片：统一的发送页/设置页分组样式
 fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.strong(title);
-        ui.add_space(4.0);
-        add(ui);
-    });
-    ui.add_space(6.0);
+    let p = theme::palette(ui);
+    egui::Frame::new()
+        .fill(p.surface)
+        .stroke(egui::Stroke::new(1.0, p.border))
+        .corner_radius(egui::CornerRadius::same(theme::CARD_RADIUS))
+        .inner_margin(egui::Margin {
+            left: theme::SPACE_LG as i8,
+            right: theme::SPACE_LG as i8,
+            top: theme::SPACE_MD as i8,
+            bottom: theme::SPACE_MD as i8,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(title).size(13.5).color(p.text));
+            ui.add_space(theme::SPACE_SM);
+            add(ui);
+        });
+    ui.add_space(10.0);
+}
+
+// ======================= 图标 / 按钮体系 =======================
+
+/// 单色矢量图标（16px 绘制档，按钮内统一 16px，页面头部 20px）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Icon {
+    Plus,
+    Refresh,
+    Close,
+    Trash,
+    Play,
+    Pause,
+    Stop,
+    ArrowDown,
+    Log,
+    Save,
+    Edit,
+}
+
+/// 按钮三级：主操作 / 次操作 / 轻操作（无底色）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BtnKind {
+    Primary,
+    Secondary,
+    Ghost,
+}
+
+/// 画一个 16px 单色图标（用 Painter 画线，避免依赖 emoji / 图标字体）
+fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: egui::Color32) {
+    let c = rect.center();
+    let s = rect.width().min(rect.height());
+    let stroke = egui::Stroke::new(1.3, color);
+    match icon {
+        Icon::Plus => {
+            let h = s * 0.30;
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - h, c.y),
+                    egui::pos2(c.x + h, c.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x, c.y - h),
+                    egui::pos2(c.x, c.y + h),
+                ],
+                stroke,
+            );
+        }
+        Icon::Close => {
+            let h = s * 0.26;
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - h, c.y - h),
+                    egui::pos2(c.x + h, c.y + h),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - h, c.y + h),
+                    egui::pos2(c.x + h, c.y - h),
+                ],
+                stroke,
+            );
+        }
+        Icon::Trash => {
+            let w = s * 0.24;
+            let top = c.y - s * 0.30;
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - w * 1.5, top),
+                    egui::pos2(c.x + w * 1.5, top),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - w * 0.4, top - s * 0.10),
+                    egui::pos2(c.x + w * 0.4, top - s * 0.10),
+                ],
+                stroke,
+            );
+            let body = egui::Rect::from_min_max(
+                egui::pos2(c.x - w, top + 3.0),
+                egui::pos2(c.x + w, c.y + s * 0.32),
+            );
+            painter.rect_stroke(
+                body,
+                egui::CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x, top + 6.0),
+                    egui::pos2(c.x, body.bottom() - 3.0),
+                ],
+                stroke,
+            );
+        }
+        Icon::Play => {
+            let h = s * 0.30;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(c.x - h * 0.7, c.y - h),
+                    egui::pos2(c.x + h * 0.9, c.y),
+                    egui::pos2(c.x - h * 0.7, c.y + h),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        Icon::Pause => {
+            let h = s * 0.28;
+            let w = s * 0.09;
+            for dx in [-w * 1.6, w * 1.6] {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(
+                        egui::pos2(c.x + dx, c.y),
+                        egui::vec2(w * 1.4, h * 2.0),
+                    ),
+                    egui::CornerRadius::same(1),
+                    color,
+                );
+            }
+        }
+        Icon::Stop => {
+            let h = s * 0.22;
+            painter.rect_filled(
+                egui::Rect::from_center_size(c, egui::vec2(h * 2.0, h * 2.0)),
+                egui::CornerRadius::same(2),
+                color,
+            );
+        }
+        Icon::ArrowDown => {
+            let h = s * 0.30;
+            painter.line_segment(
+                [
+                    egui::pos2(c.x, c.y - h),
+                    egui::pos2(c.x, c.y + h),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - h * 0.8, c.y + h * 0.25),
+                    egui::pos2(c.x, c.y + h),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x + h * 0.8, c.y + h * 0.25),
+                    egui::pos2(c.x, c.y + h),
+                ],
+                stroke,
+            );
+        }
+        Icon::Log => {
+            let w = s * 0.28;
+            for i in -1..=1 {
+                let y = c.y + i as f32 * s * 0.20;
+                painter.line_segment(
+                    [
+                        egui::pos2(c.x - w, y),
+                        egui::pos2(c.x + w, y),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        Icon::Save => {
+            let w = s * 0.26;
+            let h = s * 0.30;
+            painter.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(w * 2.0, h * 2.0)),
+                egui::CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - w * 0.9, c.y - h),
+                    egui::pos2(c.x + w * 0.5, c.y - h),
+                ],
+                stroke,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    egui::pos2(c.x - w * 0.6, c.y + h * 0.15),
+                    egui::pos2(c.x + w * 0.6, c.y + h),
+                ),
+                egui::CornerRadius::same(1),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        Icon::Edit => {
+            let h = s * 0.28;
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - h, c.y + h),
+                    egui::pos2(c.x + h * 0.8, c.y - h * 0.8),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - h, c.y + h),
+                    egui::pos2(c.x - h * 0.2, c.y + h),
+                ],
+                stroke,
+            );
+        }
+        Icon::Refresh => {
+            let r = s * 0.30;
+            let mut pts = Vec::new();
+            for i in 0..=9 {
+                let a = -0.55 + i as f32 * 0.60;
+                pts.push(egui::pos2(c.x + r * a.cos(), c.y + r * a.sin()));
+            }
+            if pts.len() >= 2 {
+                let last = pts[pts.len() - 1];
+                painter.add(egui::Shape::line(pts, stroke));
+                painter.line_segment(
+                    [last, last + egui::vec2(-r * 0.55, r * 0.25)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [last, last + egui::vec2(-r * 0.15, -r * 0.55)],
+                    stroke,
+                );
+            }
+        }
+    }
+}
+
+/// 颜色加透明度（用于禁用态 / 语义色底色）
+fn tint(color: egui::Color32, alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+/// 两色线性混合（用于开关轨道、进度等过渡）
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    egui::Color32::from_rgba_unmultiplied(
+        (a.r() as f32 * (1.0 - t) + b.r() as f32 * t) as u8,
+        (a.g() as f32 * (1.0 - t) + b.g() as f32 * t) as u8,
+        (a.b() as f32 * (1.0 - t) + b.b() as f32 * t) as u8,
+        (a.a() as f32 * (1.0 - t) + b.a() as f32 * t) as u8,
+    )
+}
+
+fn button(ui: &mut egui::Ui, kind: BtnKind, icon: Option<Icon>, text: &str) -> egui::Response {
+    button_tinted(ui, kind, icon, text, None, None)
+}
+
+/// 自绘按钮：primary / secondary / ghost 三级；可选 16px 图标 + 可选覆盖底色
+fn button_tinted(
+    ui: &mut egui::Ui,
+    kind: BtnKind,
+    icon: Option<Icon>,
+    text: &str,
+    fill_override: Option<egui::Color32>,
+    ink_override: Option<egui::Color32>,
+) -> egui::Response {
+    let p = theme::palette(ui);
+    let enabled = ui.is_enabled();
+    let height = 28.0;
+
+    let ink = match kind {
+        BtnKind::Primary => ink_override.unwrap_or(p.accent_ink),
+        BtnKind::Secondary => p.text,
+        BtnKind::Ghost => p.text_secondary,
+    };
+    let ink = if enabled { ink } else { tint(ink, 110) };
+
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), egui::FontId::proportional(13.0), ink);
+
+    let has_icon = icon.is_some();
+    let icon_w = if has_icon { 16.0 } else { 0.0 };
+    let gap = if has_icon && !text.is_empty() { 6.0 } else { 0.0 };
+    let pad_x = if text.is_empty() { 6.0 } else { 11.0 };
+    let width = if text.is_empty() {
+        if has_icon {
+            icon_w + pad_x * 2.0
+        } else {
+            20.0
+        }
+    } else {
+        (galley.size().x + icon_w + gap + pad_x * 2.0).max(56.0)
+    };
+
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), sense);
+    let hovered = enabled && resp.hovered();
+    let pressed = enabled && resp.is_pointer_button_down_on();
+
+    let radius = egui::CornerRadius::same(theme::CONTROL_RADIUS);
+    let painter = ui.painter();
+
+    let (bg, border) = match kind {
+        BtnKind::Primary => (fill_override.unwrap_or(p.accent), None),
+        BtnKind::Secondary => (
+            if hovered { p.hover } else { p.surface_alt },
+            Some(if hovered { p.border_hover } else { p.border }),
+        ),
+        BtnKind::Ghost => (
+            if hovered { p.hover } else { egui::Color32::TRANSPARENT },
+            None,
+        ),
+    };
+    let bg = if enabled { bg } else { tint(bg, 100) };
+    painter.rect_filled(rect, radius, bg);
+    if let Some(b) = border {
+        painter.rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, if enabled { b } else { tint(b, 120) }),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if pressed {
+        painter.rect_filled(rect, radius, egui::Color32::from_black_alpha(22));
+    }
+
+    let content_w = galley.size().x + icon_w + gap;
+    let start_x = rect.center().x - content_w * 0.5;
+    if let Some(icon) = icon {
+        paint_icon(
+            painter,
+            egui::Rect::from_center_size(
+                egui::pos2(start_x + icon_w * 0.5, rect.center().y),
+                egui::vec2(16.0, 16.0),
+            ),
+            icon,
+            ink,
+        );
+    }
+    painter.galley(
+        egui::pos2(start_x + icon_w + gap, rect.center().y - galley.size().y * 0.5),
+        galley,
+        ink,
+    );
+
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// 主操作 CTA（132×34，发送页底栏用）
+fn button_cta(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+    let p = theme::palette(ui);
+    let ink = if enabled { p.accent_ink } else { p.text_secondary };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), egui::FontId::proportional(13.5), ink);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(132.0, 34.0), sense);
+    let painter = ui.painter();
+    let radius = egui::CornerRadius::same(theme::CONTROL_RADIUS);
+    painter.rect_filled(
+        rect,
+        radius,
+        if enabled { p.accent } else { p.surface_alt },
+    );
+    if enabled && resp.hovered() {
+        painter.rect_filled(rect, radius, egui::Color32::from_black_alpha(16));
+    }
+    if enabled && resp.is_pointer_button_down_on() {
+        painter.rect_filled(rect, radius, egui::Color32::from_black_alpha(30));
+    }
+    painter.galley(rect.center() - galley.size() * 0.5, galley, ink);
+
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// 只读小徽标（不可点击）
+fn chip(ui: &mut egui::Ui, text: &str, fg: egui::Color32, bg: egui::Color32) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), egui::FontId::proportional(11.5), fg);
+    let pad = egui::vec2(8.0, 3.0);
+    let (rect, _) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::CornerRadius::same(5), bg);
+    painter.galley(rect.min + pad, galley, fg);
+}
+
+/// 可点击 chip（等级筛选等）
+fn chip_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let p = theme::palette(ui);
+    let (fg, bg) = if selected {
+        (p.accent, p.accent_soft)
+    } else {
+        (p.text_secondary, p.surface_alt)
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), egui::FontId::proportional(11.5), fg);
+    let pad = egui::vec2(9.0, 4.0);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(5),
+        if !selected && resp.hovered() {
+            p.hover
+        } else {
+            bg
+        },
+    );
+    if selected {
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(5),
+            egui::Stroke::new(1.0, tint(p.accent, 90)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    painter.galley(rect.min + pad, galley, fg);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 表单标签列（统一 12px 次级色）
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    let p = theme::palette(ui);
+    ui.label(egui::RichText::new(text).size(12.0).color(p.text_secondary));
+}
+
+/// 开关（36×20，knob 用 animate_bool 平滑滑动）
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let p = theme::palette(ui);
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(36.0, 20.0), egui::Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id, *on, 0.2);
+    let painter = ui.painter();
+    let track = mix(p.surface_alt, p.accent, t);
+    painter.rect_filled(rect, egui::CornerRadius::same(10), track);
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(10),
+        egui::Stroke::new(1.0, if resp.hovered() { p.border_hover } else { p.border }),
+        egui::StrokeKind::Inside,
+    );
+    let knob_x = egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), t);
+    painter.circle_filled(
+        egui::pos2(knob_x, rect.center().y),
+        7.0,
+        if t > 0.5 { p.accent_ink } else { p.text_secondary },
+    );
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// 日期 DragValue（按天偏移，显示为 YYYY-MM-DD）
+fn date_drag(ui: &mut egui::Ui, date: &mut (i32, u32, u32)) -> bool {
+    let today = chrono::Local::now().date_naive();
+    let current = chrono::NaiveDate::from_ymd_opt(date.0, date.1, date.2).unwrap_or(today);
+    let mut offset = current.signed_duration_since(today).num_days() as i32;
+
+    let resp = ui.add_sized(
+        [104.0, 28.0],
+        egui::DragValue::new(&mut offset)
+            .range(-3650..=3650)
+            .speed(1.0)
+            .custom_formatter(move |n, _| {
+                (today + chrono::Duration::days(n as i64))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .custom_parser(move |s| {
+                chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                    .ok()
+                    .map(|d| d.signed_duration_since(today).num_days() as f64)
+            }),
+    );
+
+    if resp.changed() {
+        if let Some(d) = today.checked_add_signed(chrono::Duration::days(offset as i64)) {
+            use chrono::Datelike;
+            *date = (d.year(), d.month(), d.day());
+        }
+    }
+    resp.changed()
+}
+
+/// 时间 DragValue（按分钟偏移，显示为 HH:MM）
+fn time_drag(ui: &mut egui::Ui, time: &mut (u32, u32, u32)) -> bool {
+    let mut minutes = time.0 * 60 + time.1;
+    let resp = ui.add_sized(
+        [72.0, 28.0],
+        egui::DragValue::new(&mut minutes)
+            .range(0..=1439)
+            .speed(1.0)
+            .custom_formatter(|n, _| {
+                let total = n as u32;
+                format!("{:02}:{:02}", total / 60, total % 60)
+            })
+            .custom_parser(|s| {
+                let (h, m) = s.trim().split_once(':')?;
+                Some(h.trim().parse::<f64>().ok()? * 60.0 + m.trim().parse::<f64>().ok()?)
+            }),
+    );
+    if resp.changed() {
+        time.0 = minutes / 60;
+        time.1 = minutes % 60;
+    }
+    resp.changed()
+}
+
+/// 附件拖放空态：虚线区，拖入高亮，点击打开文件选择
+fn drop_zone(ui: &mut egui::Ui) -> bool {
+    let p = theme::palette(ui);
+    let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 88.0),
+        egui::Sense::click(),
+    );
+
+    let stroke_color = if hovering { p.accent } else { p.border_hover };
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(theme::CARD_RADIUS),
+        if hovering {
+            p.accent_soft
+        } else {
+            p.surface_alt
+        },
+    );
+    let inner = rect.shrink(1.0);
+    let corners = [
+        inner.left_top(),
+        inner.right_top(),
+        inner.right_bottom(),
+        inner.left_bottom(),
+    ];
+    let dash = egui::Stroke::new(1.0, stroke_color);
+    for i in 0..4 {
+        painter.extend(egui::Shape::dashed_line(
+            &[corners[i], corners[(i + 1) % 4]],
+            dash,
+            7.0,
+            5.0,
+        ));
+    }
+
+    let center = rect.center();
+    paint_icon(
+        painter,
+        egui::Rect::from_center_size(
+            egui::pos2(center.x, center.y - 22.0),
+            egui::vec2(16.0, 16.0),
+        ),
+        Icon::ArrowDown,
+        if hovering { p.accent } else { p.text_secondary },
+    );
+    painter.text(
+        egui::pos2(center.x, center.y - 3.0),
+        egui::Align2::CENTER_CENTER,
+        "拖放文件到此处",
+        egui::FontId::proportional(13.5),
+        p.text,
+    );
+    painter.text(
+        egui::pos2(center.x, center.y + 15.0),
+        egui::Align2::CENTER_CENTER,
+        "或点击此区域选择文件",
+        egui::FontId::proportional(11.0),
+        p.text_secondary,
+    );
+
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// 附件类型徽标（最多 4 个字符，按类别着色）
+fn type_badge(ui: &mut egui::Ui, path: &std::path::Path) {
+    let p = theme::palette(ui);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let label = if ext.is_empty() {
+        "FILE".to_string()
+    } else {
+        ext.chars().take(4).collect::<String>().to_ascii_uppercase()
+    };
+    let color = match ext.as_str() {
+        "7z" | "zip" | "rar" | "tar" | "gz" => p.warn,
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" => p.accent,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" => p.ok,
+        _ => p.text_secondary,
+    };
+
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 20.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::CornerRadius::same(5), tint(color, 30));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(10.0),
+        color,
+    );
+}
+
+/// 单个附件行：类型徽标 + 文件名 + 体积 + 删除（不显示绝对路径）
+fn attachment_row(ui: &mut egui::Ui, path: &std::path::Path) -> bool {
+    let p = theme::palette(ui);
+    let mut deleted = false;
+    egui::Frame::new()
+        .fill(p.surface_alt)
+        .stroke(egui::Stroke::new(1.0, p.border))
+        .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
+        .inner_margin(egui::Margin {
+            left: 8,
+            right: 6,
+            top: 5,
+            bottom: 5,
+        })
+        .show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                type_badge(ui, path);
+                ui.add_space(theme::SPACE_SM);
+
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("未知文件");
+                let name_w = (ui.available_width() - 100.0).max(70.0);
+                ui.add_sized(
+                    [name_w, 18.0],
+                    egui::Label::new(
+                        egui::RichText::new(name).size(12.5).color(p.text),
+                    )
+                    .truncate(),
+                );
+
+                let size = std::fs::metadata(path)
+                    .map(|m| autofill::format_size(m.len()))
+                    .unwrap_or_else(|_| "—".to_string());
+                ui.add_sized(
+                    [56.0, 18.0],
+                    egui::Label::new(
+                        egui::RichText::new(size).size(11.0).color(p.text_secondary),
+                    )
+                    .truncate(),
+                );
+
+                if button(ui, BtnKind::Ghost, Some(Icon::Close), "").clicked() {
+                    deleted = true;
+                }
+            });
+        });
+    deleted
+}
+
+/// 账号列表行：首字符头像 + host:port · SSL · 登录名 + 状态徽标 + 次级小按钮
+fn account_row(ui: &mut egui::Ui, acc: &SmtpAccount) -> Option<AccountRowAction> {
+    let p = theme::palette(ui);
+    let mut action = None;
+
+    egui::Frame::new()
+        .fill(p.surface_alt)
+        .stroke(egui::Stroke::new(1.0, p.border))
+        .corner_radius(egui::CornerRadius::same(theme::CONTROL_RADIUS))
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 6,
+            top: 7,
+            bottom: 7,
+        })
+        .show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                // 首字符头像
+                let (avatar_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(
+                    avatar_rect,
+                    egui::CornerRadius::same(8),
+                    p.accent_soft,
+                );
+                let initial = acc
+                    .name
+                    .chars()
+                    .next()
+                    .or_else(|| acc.username.chars().next())
+                    .unwrap_or('•')
+                    .to_uppercase()
+                    .to_string();
+                painter.text(
+                    avatar_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    initial,
+                    egui::FontId::proportional(13.0),
+                    p.accent,
+                );
+
+                ui.add_space(theme::SPACE_SM);
+                let text_w = (ui.available_width() - 228.0).max(90.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(text_w, 38.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        let name = if acc.name.trim().is_empty() {
+                            "未命名账号"
+                        } else {
+                            acc.name.as_str()
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(name).size(12.5).color(p.text),
+                            )
+                            .truncate(),
+                        );
+                        let host = if acc.smtp.trim().is_empty() {
+                            "未填写服务器".to_string()
+                        } else {
+                            format!("{}:{}", acc.smtp, acc.port)
+                        };
+                        let ssl = if acc.ssl { "SSL" } else { "明文" };
+                        let user = if acc.username.trim().is_empty() {
+                            "未填写登录名"
+                        } else {
+                            acc.username.as_str()
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("{} · {} · {}", host, ssl, user))
+                                    .size(10.5)
+                                    .color(p.text_secondary),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button(ui, BtnKind::Ghost, Some(Icon::Trash), "删除").clicked() {
+                        action = Some(AccountRowAction::Delete);
+                    }
+                    if button(ui, BtnKind::Ghost, Some(Icon::Edit), "编辑").clicked() {
+                        action = Some(AccountRowAction::Edit);
+                    }
+                    status_badge(ui, acc);
+                });
+            });
+        });
+
+    action
+}
+
+/// 账号状态徽标：SMTP / 登录名 / 密码都填写才视为「可用」
+fn status_badge(ui: &mut egui::Ui, acc: &SmtpAccount) {
+    let p = theme::palette(ui);
+    let ready = !acc.smtp.trim().is_empty()
+        && !acc.username.trim().is_empty()
+        && !acc.password.trim().is_empty();
+    if ready {
+        chip(ui, "可用", p.ok, tint(p.ok, 30));
+    } else {
+        chip(ui, "待完善", p.warn, tint(p.warn, 30));
+    }
+}
+
+/// 分段控件：track + 选中 pill（自绘，避免默认按钮在窄窗口挤压换行）；返回是否切换页签
+fn tab_switch(ui: &mut egui::Ui, tab: &mut AppTab, p: theme::Palette, width: f32) -> bool {
+    let height = 30.0;
+    let (track, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(track, egui::CornerRadius::same(height as u8 / 2), p.surface_alt);
+    painter.rect_stroke(
+        track,
+        egui::CornerRadius::same(height as u8 / 2),
+        egui::Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+
+    let pad = 3.0;
+    let pill_h = height - pad * 2.0;
+    let seg_w = (width - pad * 2.0) / 2.0;
+    let tabs = [(AppTab::Send, "发送"), (AppTab::Settings, "设置")];
+    let mut changed = false;
+
+    for (i, (value, label)) in tabs.into_iter().enumerate() {
+        let x = track.left() + pad + seg_w * i as f32;
+        let pill = egui::Rect::from_min_size(
+            egui::pos2(x, track.top() + pad),
+            egui::vec2(seg_w, pill_h),
+        );
+        let resp = ui.interact(
+            pill,
+            ui.scope_id().with(("tab_switch", i)),
+            egui::Sense::click(),
+        );
+        let selected = *tab == value;
+        let radius = egui::CornerRadius::same((pill_h as u8) / 2);
+
+        if selected {
+            painter.rect_filled(pill, radius, p.accent_soft);
+        } else if resp.hovered() {
+            painter.rect_filled(pill, radius, p.hover);
+        }
+
+        let color = if selected { p.accent } else { p.text_secondary };
+        painter.text(
+            pill.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.5),
+            color,
+        );
+
+        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() && *tab != value {
+            *tab = value;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// 剩余秒数格式化为「X 天 HH:MM:SS」

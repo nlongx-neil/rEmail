@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 /// 日志级别
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LogLevel {
     Info,
     Warn,
